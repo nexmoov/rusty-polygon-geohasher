@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 use geo::{
     algorithm::{centroid::Centroid, contains::Contains},
     BoundingRect, Coord, Intersects, LineString, Polygon,
