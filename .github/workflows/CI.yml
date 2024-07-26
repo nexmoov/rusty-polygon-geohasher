@@ -51,7 +51,7 @@ jobs:
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          #name: wheels-linux-${{ matrix.platform.target }}
+          name: wheels-linux-${{ matrix.platform.target }}
           path: dist
 
   musllinux:
@@ -82,34 +82,7 @@ jobs:
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          #name: wheels-musllinux-${{ matrix.platform.target }}
-          path: dist
-
-  windows:
-    runs-on: ${{ matrix.platform.runner }}
-    strategy:
-      matrix:
-        platform:
-          - runner: windows-latest
-            target: x64
-          - runner: windows-latest
-            target: x86
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: 3.x
-          architecture: ${{ matrix.platform.target }}
-      - name: Build wheels
-        uses: PyO3/maturin-action@v1
-        with:
-          target: ${{ matrix.platform.target }}
-          args: --release --out dist
-          sccache: 'true'
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          #name: wheels-windows-${{ matrix.platform.target }}
+          name: wheels-musllinux-${{ matrix.platform.target }}
           path: dist
 
   macos:
@@ -135,7 +108,7 @@ jobs:
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          #name: wheels-macos-${{ matrix.platform.target }}
+          name: wheels-macos-${{ matrix.platform.target }}
           path: dist
 
   sdist:
@@ -150,19 +123,20 @@ jobs:
       - name: Upload sdist
         uses: actions/upload-artifact@v4
         with:
-          #name: wheels-sdist
+          name: wheels-sdist
           path: dist
 
   release:
     name: Release
     runs-on: ubuntu-latest
     if: "startsWith(github.ref, 'refs/tags/')"
-    needs: [linux, musllinux, windows, macos, sdist]
+    needs: [linux, musllinux, macos, sdist]
     permissions:
       id-token: write
     steps:
       - uses: actions/download-artifact@v4
         with:
+          name: wheels-*/*
           path: dist
       - name: Publish release distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
