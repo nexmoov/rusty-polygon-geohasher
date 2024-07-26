@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-pyo3 = { version = "0.16.4", features = ["extension-module", "abi3-py310"] }
-geo = "0.24.0"
-geohash = "0.8.0"
+pyo3 = { version = "0.16", features = ["extension-module", "abi3-py310"] }
+geo = "^0.28.0"
+geohash = "^0.13.1"
 queue = "0.3.1"
 
 [lib]
