@@ -32,10 +32,6 @@ jobs:
             target: aarch64
           - runner: ubuntu-latest
             target: armv7
-          - runner: ubuntu-latest
-            target: s390x
-          - runner: ubuntu-latest
-            target: ppc64le
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -136,7 +132,15 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: wheels-*/*
+          name: wheels-macos-x86_64
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-macos-aarch64
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-linux-x86_64
           path: dist
       - name: Publish release distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
