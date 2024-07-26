@@ -43,7 +43,7 @@ fn polygon_to_geohashes(
             let tuple: &PyTuple = item.extract()?;
             let y: f64 = tuple.get_item(0).expect("REASON").extract()?;
             let x: f64 = tuple.get_item(1).expect("REASON").extract()?;
-            coordinates.push(Coord { x, y });
+            coordinates.push(Coord::<f64> { x, y });
         }
 
         let polygon = Polygon::new(LineString::from(coordinates), vec![]);
@@ -66,19 +66,19 @@ fn polygon_to_geohashes(
                 let (decoded_centroid, lat_offset, lng_offset) = decode(&current_geohash)
                     .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{:?}", e)))?;
 
-                let corner_1 = Coord {
+                let corner_1 = Coord::<f64> {
                     y: decoded_centroid.x - lat_offset,
                     x: decoded_centroid.y - lng_offset,
                 };
-                let corner_2 = Coord {
+                let corner_2 = Coord::<f64> {
                     y: decoded_centroid.x + lat_offset,
                     x: decoded_centroid.y - lng_offset,
                 };
-                let corner_3 = Coord {
+                let corner_3 = Coord::<f64> {
                     y: decoded_centroid.x + lat_offset,
                     x: decoded_centroid.y + lng_offset,
                 };
-                let corner_4 = Coord {
+                let corner_4 = Coord::<f64> {
                     y: decoded_centroid.x - lat_offset,
                     x: decoded_centroid.y + lng_offset,
                 };
