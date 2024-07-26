@@ -142,5 +142,37 @@ jobs:
         with:
           name: wheels-linux-x86_64
           path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-linux-x86
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-linux-aarch64
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-linux-armv7
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-musllinux-x86_64
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-musllinux-x86
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-musllinux-aarch64
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-musllinux-armv7
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
       - name: Publish release distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
