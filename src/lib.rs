@@ -9,14 +9,23 @@ use pyo3::types::{PyAny, PyTuple};
 use pyo3::wrap_pyfunction;
 use std::collections::{HashSet, VecDeque};
 
-fn get_length(obj: &PyAny) -> PyResult<usize> {
-    // Ensure the object has a length
-    obj.len().map_err(|e| e.into())
-}
 
-#[pyfunction]
-fn object_length(#[pyo3(from_py_with = "get_length")] length: usize) -> usize {
-    length
+fn extract_polygon(curr_geom: &PyAny) -> Result<Polygon<f64>, PyErr>  {
+    let coords_list: &PyAny = curr_geom
+            .getattr("exterior")?
+            .getattr("coords")?
+            .extract()?;
+    let mut coordinates = Vec::<Coord<f64>>::new();
+    for coords_idx in 0..=coords_list.len()? - 1 {
+        let item = coords_list.get_item(coords_idx)?;
+        let tuple: &PyTuple = item.extract()?;
+        let y: f64 = tuple.get_item(0).expect("Fatal error; missing coordinate").extract()?;
+        let x: f64 = tuple.get_item(1).expect("Fatal error; missing coordinate").extract()?;
+        coordinates.push(Coord::<f64> { x, y });
+    }
+    Ok(
+        Polygon::new(LineString::from(coordinates), vec![])
+    )
 }
 
 #[pyfunction]
@@ -29,26 +38,23 @@ fn polygon_to_geohashes(
     let mut inner_geohashes = HashSet::new();
     let mut outer_geohashes = HashSet::new();
 
-    let geoms_collection: &PyAny = py_polygon.getattr("geoms")?.extract()?;
+    let mut polygons = Vec::<Polygon<f64>>::new();
 
-    for curr_geom_idx in 0..=get_length(geoms_collection)? - 1 {
-        let curr_geom: &PyAny = geoms_collection.get_item(curr_geom_idx)?;
-        let coords_list: &PyAny = curr_geom
-            .getattr("exterior")?
-            .getattr("coords")?
-            .extract()?;
-        let mut coordinates = Vec::<Coord<f64>>::new();
-        for coords_idx in 0..=get_length(coords_list)? - 1 {
-            let item = coords_list.get_item(coords_idx)?;
-            let tuple: &PyTuple = item.extract()?;
-            let y: f64 = tuple.get_item(0).expect("REASON").extract()?;
-            let x: f64 = tuple.get_item(1).expect("REASON").extract()?;
-            coordinates.push(Coord::<f64> { x, y });
-        }
+    // Check if we have a collection of polygons by trying to get the `geom` attribute
+    match py_polygon.getattr("geoms") {
+        Ok(geoms_collection) => {
+            for curr_geom_idx in 0..=geoms_collection.len()? - 1 {
+                let curr_geom: &PyAny = geoms_collection.get_item(curr_geom_idx)?;
+                polygons.push(extract_polygon(curr_geom)?);
+            }
+        },
+        Err(_) => {
+            // We probably have a single polygon 
+            polygons.push(extract_polygon(py_polygon)?);
+        },
+    }
 
-        let polygon = Polygon::new(LineString::from(coordinates), vec![]);
-
-
+    for polygon in &polygons {
         let envelope = polygon.bounding_rect().unwrap();
         let poly_envelope = envelope.to_polygon();
 
