@@ -1,0 +1,10 @@
+#[build]
+#target = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]
+
+
+# https://github.com/PyO3/rust-numpy/issues/223
+[target.aarch64-apple-darwin]
+rustflags = [
+  "-C", "link-arg=-undefined",
+  "-C", "link-arg=dynamic_lookup",
+]
