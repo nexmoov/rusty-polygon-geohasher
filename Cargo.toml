@@ -1,7 +1,12 @@
 [package]
 name = "rusty-polygon-geohasher"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
+authors = ["Francois Maillet <francois@locallogic.co>"]
+homepage = "https://github.com/nexmoov/rusty-polygon-geohasher"
+lisence = "MIT"
+readme = "README.md"
+keywords=["polygon", "geohashes", "geospatial"]
 
 [dependencies]
 pyo3 = { version = "0.16", features = ["extension-module", "abi3-py310"] }

@@ -19,7 +19,35 @@ permissions:
   contents: read
 
 jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Poetry
+        run: pipx install poetry
+      - uses: actions/setup-python@v5
+        with:
+          python-version: 3.x
+          cache: "poetry"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          args: --release --out dist
+          sccache: 'true'
+      - name: pytest
+        run: |
+          pipx ensurepath
+          poetry export -f requirements.txt --with dev --output requirements.txt
+          set -e
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install -r requirements.txt
+          pip install rusty_polygon_geohasher --find-links dist --force-reinstall
+          pip install pytest
+          pytest
+
   linux:
+    needs: [tests]
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -51,6 +79,7 @@ jobs:
           path: dist
 
   musllinux:
+    needs: [tests]
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -80,8 +109,36 @@ jobs:
         with:
           name: wheels-musllinux-${{ matrix.platform.target }}
           path: dist
+  windows:
+    needs: [tests]
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      matrix:
+        platform:
+          - runner: windows-latest
+            target: x64
+          - runner: windows-latest
+            target: x86
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: 3.x
+          architecture: ${{ matrix.platform.target }}
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist
+          sccache: 'true'
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-${{ matrix.platform.target }}
+          path: dist
 
   macos:
+    needs: [tests]
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -108,6 +165,7 @@ jobs:
           path: dist
 
   sdist:
+    needs: [tests]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -126,7 +184,7 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     if: "startsWith(github.ref, 'refs/tags/')"
-    needs: [linux, musllinux, macos, sdist]
+    needs: [linux, musllinux, macos, windows, sdist]
     permissions:
       id-token: write
     steps:
@@ -169,6 +227,14 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: wheels-musllinux-armv7
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-windows-x86
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-windows-x64
           path: dist
       - uses: actions/download-artifact@v4
         with:
