@@ -33,7 +33,7 @@ jobs:
         run: |
           pipx ensurepath
           poetry install --with dev
-          poetry run maturin develop -r --out dist
+          poetry run maturin build --out dist
           poetry run pip install geohash_polygon --find-links dist --force-reinstall
           poetry run pytest
 
@@ -191,7 +191,7 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     if: "startsWith(github.ref, 'refs/tags/')"
-    needs: [linux, musllinux, macos, sdist]
+    needs: [linux, musllinux, macos, windows, sdist]
     permissions:
       id-token: write
     steps:
