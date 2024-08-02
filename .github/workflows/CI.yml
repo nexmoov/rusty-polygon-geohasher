@@ -49,6 +49,14 @@ jobs:
         with:
           name: wheels-linux-${{ matrix.platform.target }}
           path: dist
+      - name: pytest
+        run: |
+          set -e
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install geohash_polygon --find-links dist --force-reinstall
+          pip install pytest
+          pytest
 
   musllinux:
     runs-on: ${{ matrix.platform.runner }}
@@ -94,6 +102,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: 3.x
+          architecture: ${{ matrix.platform.target }}
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -131,6 +140,14 @@ jobs:
         with:
           name: wheels-macos-${{ matrix.platform.target }}
           path: dist
+      - name: pytest
+        run: |
+          set -e
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install geohash_polygon --find-links dist --force-reinstall
+          pip install pytest
+          pytest
 
   sdist:
     runs-on: ubuntu-latest
