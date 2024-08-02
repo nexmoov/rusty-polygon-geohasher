@@ -32,7 +32,6 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
-          target: aarch64
           args: --release --out dist
           sccache: 'true'
       - name: pytest

@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "rusty-polygon-geohasher"
-version = "0.1.3"
+version = "0.1.4"
 description = "A Rust implementation of the polygon to geohash library"
 readme = "README.md"
 authors = ["Francois Maillet <francois@locallogic.co>"]
