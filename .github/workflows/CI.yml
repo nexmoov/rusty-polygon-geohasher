@@ -29,13 +29,22 @@ jobs:
         with:
           python-version: 3.x
           cache: "poetry"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: aarch64
+          args: --release --out dist
+          sccache: 'true'
       - name: pytest
         run: |
           pipx ensurepath
-          poetry install --with dev
-          poetry run maturin build --out dist
-          poetry run pip install geohash_polygon --find-links dist --force-reinstall
-          poetry run pytest
+          poetry export -f requirements.txt --with dev --output requirements.txt
+          set -e
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install -r requirements.txt
+          pip install geohash_polygon --find-links dist --force-reinstall
+          pip install pytest
 
   linux:
     needs: [tests]

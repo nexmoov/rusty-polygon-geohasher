@@ -24,9 +24,9 @@ maturin = "^1.7.0"
 shapely = "^2.0.5"
 ruff = "^0.5.5"
 pytest-benchmark = "^4.0.0"
-
 six = "^1.16.0"
 polygon-geohasher = "^0.0.1"
+
 [build-system]
 requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
