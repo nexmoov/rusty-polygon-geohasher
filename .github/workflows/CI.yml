@@ -43,8 +43,9 @@ jobs:
           python3 -m venv .venv
           source .venv/bin/activate
           pip install -r requirements.txt
-          pip install geohash_polygon --find-links dist --force-reinstall
+          pip install rusty_polygon_geohasher --find-links dist --force-reinstall
           pip install pytest
+          pytest
 
   linux:
     needs: [tests]
