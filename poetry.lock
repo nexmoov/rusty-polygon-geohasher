@@ -146,6 +146,21 @@ dev = ["pre-commit", "tox"]
 testing = ["pytest", "pytest-benchmark"]
 
 [[package]]
+name = "polygon-geohasher"
+version = "0.0.1"
+description = "Wrapper over Shapely that returns the set of geohashes that form a Polygon"
+optional = false
+python-versions = "*"
+files = [
+    {file = "polygon-geohasher-0.0.1.tar.gz", hash = "sha256:5c9f8788fa38df1606c7bd9e85fce636c8520a19a675c106ee387c0f613697ef"},
+    {file = "polygon_geohasher-0.0.1-py2-none-any.whl", hash = "sha256:c5072aa504705ad59c6454cee6093e8941447e83035a1903182a8eba6dc76f77"},
+]
+
+[package.dependencies]
+python-geohash = "*"
+shapely = "*"
+
+[[package]]
 name = "py-cpuinfo"
 version = "9.0.0"
 description = "Get CPU info with pure Python"
@@ -197,6 +212,16 @@ pytest = ">=3.8"
 aspect = ["aspectlib"]
 elasticsearch = ["elasticsearch"]
 histogram = ["pygal", "pygaljs"]
+
+[[package]]
+name = "python-geohash"
+version = "0.8.5"
+description = "Fast, accurate python geohashing library"
+optional = false
+python-versions = "*"
+files = [
+    {file = "python-geohash-0.8.5.tar.gz", hash = "sha256:05a21fcf4eda1a5eddbd291890ade23fc5ddaa6bb98f2ee23d2d384ed14f086d"},
+]
 
 [[package]]
 name = "ruff"
@@ -302,4 +327,4 @@ files = [
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.10"
-content-hash = "764eb8a58df035e2a7e5e1c51ea32030ff6495696bb4925cc7db95e584cfc674"
+content-hash = "0eac3528d5fe6b5056780ae801851ae0573dcf02656e2102391e1dc29fe9b3ec"
