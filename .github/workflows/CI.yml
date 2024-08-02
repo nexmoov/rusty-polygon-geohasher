@@ -77,14 +77,6 @@ jobs:
         with:
           name: wheels-linux-${{ matrix.platform.target }}
           path: dist
-      - name: pytest
-        run: |
-          set -e
-          python3 -m venv .venv
-          source .venv/bin/activate
-          pip install geohash_polygon --find-links dist --force-reinstall
-          pip install pytest
-          pytest
 
   musllinux:
     needs: [tests]
@@ -171,14 +163,6 @@ jobs:
         with:
           name: wheels-macos-${{ matrix.platform.target }}
           path: dist
-      - name: pytest
-        run: |
-          set -e
-          python3 -m venv .venv
-          source .venv/bin/activate
-          pip install geohash_polygon --find-links dist --force-reinstall
-          pip install pytest
-          pytest
 
   sdist:
     needs: [tests]
