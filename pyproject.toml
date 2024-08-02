@@ -5,7 +5,7 @@ description = "A Rust implementation of the polygon to geohash library"
 readme = "README.md"
 authors = ["Francois Maillet <francois@locallogic.co>"]
 license = "MIT"
-repository = "https://github.com/mailletf/rusty-polygon-geohasher"
+repository = "https://github.com/nexmoov/rusty-polygon-geohasher"
 keywords=["polygon", "geohashes", "geospatial"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -16,6 +16,9 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Rust"
 ]
+
+[project.urls]
+repository = "https://github.com/nexmoov/rusty-polygon-geohasher"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.2"
