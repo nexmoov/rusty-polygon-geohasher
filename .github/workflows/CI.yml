@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,6 +36,7 @@ jobs:
           poetry run pytest
 
   linux:
+    needs: [tests]
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -75,6 +76,7 @@ jobs:
           pytest
 
   musllinux:
+    needs: [tests]
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -105,6 +107,7 @@ jobs:
           name: wheels-musllinux-${{ matrix.platform.target }}
           path: dist
   windows:
+    needs: [tests]
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -132,6 +135,7 @@ jobs:
           path: dist
 
   macos:
+    needs: [tests]
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -166,6 +170,7 @@ jobs:
           pytest
 
   sdist:
+    needs: [tests]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
