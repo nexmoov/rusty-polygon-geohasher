@@ -3,9 +3,15 @@ import geohash_polygon
 from polygon_geohasher.polygon_geohasher import (
     polygon_to_geohashes as polygon_to_geohashes_py,
 )
+import pytest
 
-# def test_invalid():
-#    assert geohash_polygon.polygon_to_geohashes("bouya", 3, True) == set()
+
+def test_exception_when_invalid():
+    with pytest.raises(
+        ValueError,
+        match=r"Exception while trying to extract Geometry. This function requires a Shapely Polygon or MultiPolygon.*",
+    ):
+        geohash_polygon.polygon_to_geohashes({}, 3, True)
 
 
 def test_simple_polygon():
