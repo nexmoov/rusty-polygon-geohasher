@@ -14,7 +14,7 @@ use std::collections::{HashSet, VecDeque};
 #[pyfunction]
 fn polygon_to_geohashes(
     _py: Python,
-    py_polygon: &PyAny,
+    py_polygon: Bound<'_, PyAny>,
     precision: usize,
     inner: bool,
 ) -> PyResult<HashSet<String>> {
@@ -98,7 +98,7 @@ fn polygon_to_geohashes(
 }
 
 #[pymodule]
-fn geohash_polygon(_py: Python, m: &PyModule) -> PyResult<()> {
+fn geohash_polygon(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(polygon_to_geohashes, m)?)?;
     Ok(())
 }
