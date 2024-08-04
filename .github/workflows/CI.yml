@@ -31,7 +31,7 @@ jobs:
         with:
           python-version: 3.x
           cache: "poetry"
-      - uses: pre-commit/action@v3
+      - uses: pre-commit/action@v3.0.1
   tests:
     runs-on: ubuntu-latest
     needs: [run_pre_commit]
