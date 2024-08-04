@@ -22,7 +22,15 @@ fn polygon_to_geohashes(
 
     let mut polygons = Vec::<Polygon<f64>>::new();
 
-    let geom = py_polygon.extract::<Geometry>()?;
+    let geom: Geometry = match py_polygon.extract::<Geometry>() {
+        Ok(geometry) => geometry,
+        Err(e) => {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("Exception while trying to extract Geometry. This function requires a Shapely Polygon or MultiPolygon. ({:?})", e
+            )))
+        }
+    };
+
     if let Err(e) = {
         match geom.0 {
             GtGeometry::Polygon(polygon) => {
