@@ -1,15 +1,14 @@
 use geo::{
     algorithm::{centroid::Centroid, contains::Contains},
-    BoundingRect, Intersects, Polygon
+    BoundingRect, Intersects, Polygon,
 };
-use py_geo_interface::Geometry;
-use geo_types::{Geometry as GtGeometry};
+use geo_types::Geometry as GtGeometry;
 use geohash::{decode_bbox, encode, neighbors};
+use py_geo_interface::Geometry;
 use pyo3::prelude::*;
-use pyo3::types::{PyAny};
+use pyo3::types::PyAny;
 use pyo3::wrap_pyfunction;
 use std::collections::{HashSet, VecDeque};
-
 
 #[pyfunction]
 fn polygon_to_geohashes(
@@ -24,19 +23,21 @@ fn polygon_to_geohashes(
     let mut polygons = Vec::<Polygon<f64>>::new();
 
     let geom = py_polygon.extract::<Geometry>()?;
-    if let Err(e) = { match geom.0 {
-        GtGeometry::Polygon(polygon) => {
-            polygons.push(polygon);
-            Ok(())
-        },
-        GtGeometry::MultiPolygon(multipolygon) => {
-            for polygon in multipolygon {
+    if let Err(e) = {
+        match geom.0 {
+            GtGeometry::Polygon(polygon) => {
                 polygons.push(polygon);
+                Ok(())
             }
-            Ok(())
-        },
-        _ => Err("The geometry is not a Polygon or MultiPolygon")
-    }} {
+            GtGeometry::MultiPolygon(multipolygon) => {
+                for polygon in multipolygon {
+                    polygons.push(polygon);
+                }
+                Ok(())
+            }
+            _ => Err("The geometry is not a Polygon or MultiPolygon"),
+        }
+    } {
         return Err(pyo3::exceptions::PyValueError::new_err(e));
     }
 

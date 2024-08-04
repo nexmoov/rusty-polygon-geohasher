@@ -19,8 +19,22 @@ permissions:
   contents: read
 
 jobs:
+  run_pre_commit:
+    name: Run pre-commit hooks
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Poetry
+        run: pipx install poetry
+      - uses: actions/setup-python@v5
+        with:
+          python-version: 3.x
+          cache: "poetry"
+      - uses: pre-commit/action@v3
   tests:
     runs-on: ubuntu-latest
+    needs: [run_pre_commit]
     steps:
       - uses: actions/checkout@v4
       - name: Install Poetry

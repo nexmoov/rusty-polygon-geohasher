@@ -1,22 +1,38 @@
 import shapely
 import geohash_polygon
-from polygon_geohasher.polygon_geohasher import polygon_to_geohashes as polygon_to_geohashes_py
+from polygon_geohasher.polygon_geohasher import (
+    polygon_to_geohashes as polygon_to_geohashes_py,
+)
 
 # def test_invalid():
 #    assert geohash_polygon.polygon_to_geohashes("bouya", 3, True) == set()
 
+
 def test_simple_polygon():
-    polygon = shapely.geometry.Polygon([(-99.1795917, 19.432134), (-99.1656847, 19.429034),
-                            (-99.1776492, 19.414236), (-99.1795917, 19.432134)])
-    assert geohash_polygon.polygon_to_geohashes(polygon, 5, inner=False) == {'9g3qr', '9g3qx'}
+    polygon = shapely.geometry.Polygon(
+        [
+            (-99.1795917, 19.432134),
+            (-99.1656847, 19.429034),
+            (-99.1776492, 19.414236),
+            (-99.1795917, 19.432134),
+        ]
+    )
+    assert geohash_polygon.polygon_to_geohashes(polygon, 5, inner=False) == {
+        "9g3qr",
+        "9g3qx",
+    }
 
 
 def test_whitehorse():
-    verdun_poly = shapely.from_wkt(open("tests/data/verdun_wkt.txt").read())
     whitehorse_poly = shapely.from_wkt(open("tests/data/whitehorse_wkt.txt").read())
 
-    assert geohash_polygon.polygon_to_geohashes(whitehorse_poly, 6, False) == polygon_to_geohashes_py(whitehorse_poly, 6, False)
-    assert geohash_polygon.polygon_to_geohashes(whitehorse_poly, 6, True) == polygon_to_geohashes_py(whitehorse_poly, 6, True)
+    assert geohash_polygon.polygon_to_geohashes(
+        whitehorse_poly, 6, False
+    ) == polygon_to_geohashes_py(whitehorse_poly, 6, False)
+    assert geohash_polygon.polygon_to_geohashes(
+        whitehorse_poly, 6, True
+    ) == polygon_to_geohashes_py(whitehorse_poly, 6, True)
+
 
 def test_verdun():
     verdun_poly = shapely.from_wkt(open("tests/data/verdun_wkt.txt").read())
