@@ -81,8 +81,7 @@ fn polygon_to_geohashes(
                     }
 
                     if let Ok(rez) = neighbors(&current_geohash) {
-                        for neighbor in
-                            vec![rez.sw, rez.s, rez.se, rez.w, rez.e, rez.nw, rez.n, rez.ne]
+                        for neighbor in [rez.sw, rez.s, rez.se, rez.w, rez.e, rez.nw, rez.n, rez.ne]
                         {
                             if !inner_geohashes.contains(&neighbor)
                                 && !outer_geohashes.contains(&neighbor)
