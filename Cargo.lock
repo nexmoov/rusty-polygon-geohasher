@@ -381,11 +381,7 @@ dependencies = [
 
 [[package]]
 name = "rusty-polygon-geohasher"
-<<<<<<< Updated upstream
 version = "0.2.1"
-=======
-version = "0.1.4"
->>>>>>> Stashed changes
 dependencies = [
  "geo",
  "geo-types",
