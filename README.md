@@ -1,6 +1,6 @@
 
-[![build](https://github.com/nexmoov/rusty-polygon-geohasher/actions/workflows/CI.yml/badge.svg)](https://github.com/nexmoov/rusty-polygon-geohasher/actions/workflows/CI.yml)
-[![Package version](https://img.shields.io/pypi/v/rusty-polygon-geohasher.svg)[https://pypi.org/project/rusty-polygon-geohasher]
+[![CI](https://github.com/nexmoov/rusty-polygon-geohasher/actions/workflows/CI.yml/badge.svg)](https://github.com/nexmoov/rusty-polygon-geohasher/actions/workflows/CI.yml)
+[![Package version](https://img.shields.io/pypi/v/rusty-polygon-geohasher.svg)](https://pypi.org/project/rusty-polygon-geohasher)
 
 # rusty-polygon-geohasher
 
