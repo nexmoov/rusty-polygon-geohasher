@@ -1,3 +1,7 @@
+
+[![build](https://github.com/nexmoov/rusty-polygon-geohasher/actions/workflows/CI.yml/badge.svg)](https://github.com/nexmoov/rusty-polygon-geohasher/actions/workflows/CI.yml)
+[![Package version](https://img.shields.io/pypi/v/rusty-polygon-geohasher.svg)[https://pypi.org/project/rusty-polygon-geohasher]
+
 # rusty-polygon-geohasher
 
 Polygon Geohasher is an open source Python package for converting Shapely's polygons into a set of geohashes. It obtains the set of geohashes inside a polygon or geohashes that touch (intersect) the polygon.
