@@ -6,12 +6,30 @@ from polygon_geohasher.polygon_geohasher import (
 import pytest
 
 
-def test_exception_when_invalid():
+@pytest.mark.parametrize(
+    "polygon, exception_message_idx",
+    [
+        (None, 0),
+        (True, 0),
+        ("string", 0),
+        (1, 0),
+        (1.0, 0),
+        ([1, 2, 3], 0),
+        ((1, 2, 3), 0),
+        ({}, 0),
+        (shapely.geometry.Point((-99.1795917, 19.432134)), 1),
+    ],
+)
+def test_exception_when_invalid(polygon, exception_message_idx):
+    exception_messages = [
+        r"Exception while trying to extract Geometry. This function requires a Shapely Polygon or MultiPolygon.*",
+        r"The geometry is not a Polygon or MultiPolygon",
+    ]
     with pytest.raises(
         ValueError,
-        match=r"Exception while trying to extract Geometry. This function requires a Shapely Polygon or MultiPolygon.*",
+        match=exception_messages[exception_message_idx],
     ):
-        geohash_polygon.polygon_to_geohashes({}, 3, True)
+        geohash_polygon.polygon_to_geohashes(polygon, 3, True)
 
 
 def test_simple_polygon():
@@ -29,33 +47,29 @@ def test_simple_polygon():
     }
 
 
-def test_whitehorse():
-    whitehorse_poly = shapely.from_wkt(open("tests/data/whitehorse_wkt.txt").read())
-
+def test_whitehorse(polygon_whitehorse):
     assert geohash_polygon.polygon_to_geohashes(
-        whitehorse_poly, 6, False
-    ) == polygon_to_geohashes_py(whitehorse_poly, 6, False)
+        polygon_whitehorse, 6, False
+    ) == polygon_to_geohashes_py(polygon_whitehorse, 6, False)
     assert geohash_polygon.polygon_to_geohashes(
-        whitehorse_poly, 6, True
-    ) == polygon_to_geohashes_py(whitehorse_poly, 6, True)
+        polygon_whitehorse, 6, True
+    ) == polygon_to_geohashes_py(polygon_whitehorse, 6, True)
 
 
-def test_verdun():
-    verdun_poly = shapely.from_wkt(open("tests/data/verdun_wkt.txt").read())
+def test_verdun(polygon_verdun):
+    assert geohash_polygon.polygon_to_geohashes(polygon_verdun, 3, True) == set()
+    assert geohash_polygon.polygon_to_geohashes(polygon_verdun, 4, True) == set()
+    assert geohash_polygon.polygon_to_geohashes(polygon_verdun, 5, True) == set()
 
-    assert geohash_polygon.polygon_to_geohashes(verdun_poly, 3, True) == set()
-    assert geohash_polygon.polygon_to_geohashes(verdun_poly, 4, True) == set()
-    assert geohash_polygon.polygon_to_geohashes(verdun_poly, 5, True) == set()
-
-    assert geohash_polygon.polygon_to_geohashes(verdun_poly, 1, False) == {"f"}
-    assert geohash_polygon.polygon_to_geohashes(verdun_poly, 4, False) == {"f25d"}
-    assert geohash_polygon.polygon_to_geohashes(verdun_poly, 5, False) == {
+    assert geohash_polygon.polygon_to_geohashes(polygon_verdun, 1, False) == {"f"}
+    assert geohash_polygon.polygon_to_geohashes(polygon_verdun, 4, False) == {"f25d"}
+    assert geohash_polygon.polygon_to_geohashes(polygon_verdun, 5, False) == {
         "f25dm",
         "f25dt",
         "f25dw",
     }
 
-    assert geohash_polygon.polygon_to_geohashes(verdun_poly, 7, False) == {
+    assert geohash_polygon.polygon_to_geohashes(polygon_verdun, 7, False) == {
         "f25dtej",
         "f25dtek",
         "f25dtyq",
