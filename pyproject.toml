@@ -29,6 +29,7 @@ polygon-geohasher = "^0.0.1"
 pre-commit = "^3.8.0"
 ipython = "^8.26.0"
 
+geopandas = "^1.0.1"
 [tool.poetry.group.troubleshooting.dependencies]
 pandas = "^2.2.2"
 

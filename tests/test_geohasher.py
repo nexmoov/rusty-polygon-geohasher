@@ -32,7 +32,26 @@ def test_exception_when_invalid(polygon, exception_message_idx):
         geohash_polygon.polygon_to_geohashes(polygon, 3, True)
 
 
-def test_simple_polygon():
+@pytest.mark.parametrize(
+    "level, inner",
+    [
+        (1, False),
+        (1, True),
+        (2, False),
+        (2, True),
+        (3, False),
+        (3, True),
+        (4, False),
+        (4, True),
+        (5, False),
+        (5, True),
+        (6, False),
+        (6, True),
+        (7, False),
+        (7, True),
+    ],
+)
+def test_simple_polygon(level, inner):
     polygon = shapely.geometry.Polygon(
         [
             (-99.1795917, 19.432134),
@@ -41,19 +60,34 @@ def test_simple_polygon():
             (-99.1795917, 19.432134),
         ]
     )
-    assert geohash_polygon.polygon_to_geohashes(polygon, 5, inner=False) == {
-        "9g3qr",
-        "9g3qx",
-    }
+    assert geohash_polygon.polygon_to_geohashes(
+        polygon, level, inner
+    ) == polygon_to_geohashes_py(polygon, level, inner)
 
 
-def test_whitehorse(polygon_whitehorse):
+@pytest.mark.parametrize(
+    "level, inner",
+    [
+        (1, False),
+        (1, True),
+        (2, False),
+        (2, True),
+        (3, False),
+        (3, True),
+        (4, False),
+        (4, True),
+        (5, False),
+        (5, True),
+        (6, False),
+        (6, True),
+        # (7, False),
+        # (7, True),
+    ],
+)
+def test_whitehorse(level, inner, polygon_whitehorse):
     assert geohash_polygon.polygon_to_geohashes(
-        polygon_whitehorse, 6, False
-    ) == polygon_to_geohashes_py(polygon_whitehorse, 6, False)
-    assert geohash_polygon.polygon_to_geohashes(
-        polygon_whitehorse, 6, True
-    ) == polygon_to_geohashes_py(polygon_whitehorse, 6, True)
+        polygon_whitehorse, level, inner
+    ) == polygon_to_geohashes_py(polygon_whitehorse, level, inner)
 
 
 def test_verdun(polygon_verdun):
