@@ -1,6 +1,6 @@
 use geo::{
     algorithm::{centroid::Centroid, contains::Contains},
-    BoundingRect, Intersects, Polygon,
+    Intersects, Polygon,
 };
 use geo_types::Geometry as GtGeometry;
 use geohash::{decode_bbox, encode, neighbors};
@@ -53,7 +53,6 @@ fn polygon_to_geohashes(
     // geohashes that are candidates to be tested.
     let mut candidate_geohashes = HashSet::new();
 
-    //let mut tested = 0;
     for polygon in &polygons {
         let centroid = polygon.centroid().unwrap();
         let centroid_geohash = encode((centroid.x(), centroid.y()).into(), precision)
@@ -63,16 +62,24 @@ fn polygon_to_geohashes(
         testing_geohashes.push_back(centroid_geohash);
 
         while let Some(current_geohash) = testing_geohashes.pop_front() {
-            //tested += 1;
             let rect_bbox = decode_bbox(&current_geohash)
                 .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{:?}", e)))?;
             let current_polygon = rect_bbox.to_polygon();
 
-            if polygon.contains(&current_polygon)
-                || (!inner && polygon.intersects(&current_polygon))
-            {
+            let contains: bool = polygon.contains(&current_polygon);
+            let intersects: bool = match contains {
+                true => false,
+                false => polygon.intersects(&current_polygon),
+            };
+            let add_to_inner = contains || (!inner && intersects);
+            if add_to_inner {
                 inner_geohashes.insert(current_geohash.clone());
+            } else {
+                outer_geohashes.insert(current_geohash.clone());
+            }
 
+            if add_to_inner || intersects {
+                // polygon.intersects(&current_polygon) {
                 if let Ok(rez) = neighbors(&current_geohash) {
                     for neighbor in [rez.s, rez.w, rez.e, rez.n] {
                         if (!inner_geohashes.contains(&neighbor)
@@ -84,12 +91,9 @@ fn polygon_to_geohashes(
                         }
                     }
                 }
-            } else {
-                outer_geohashes.insert(current_geohash);
             }
         }
     }
-    //println!("tested: {}", tested);
     Ok(inner_geohashes)
 }
 
