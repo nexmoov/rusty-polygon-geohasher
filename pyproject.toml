@@ -26,12 +26,13 @@ ruff = "^0.5.5"
 pytest-benchmark = "^4.0.0"
 six = "^1.16.0"
 polygon-geohasher = "^0.0.1"
-
 pre-commit = "^3.8.0"
-[tool.poetry.group.troubleshooting.dependencies]
 ipython = "^8.26.0"
 
+geopandas = "^1.0.1"
+[tool.poetry.group.troubleshooting.dependencies]
 pandas = "^2.2.2"
+
 [build-system]
 requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"

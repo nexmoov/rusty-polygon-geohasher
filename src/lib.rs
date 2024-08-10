@@ -1,6 +1,6 @@
 use geo::{
     algorithm::{centroid::Centroid, contains::Contains},
-    BoundingRect, Intersects, Polygon,
+    Intersects, Polygon,
 };
 use geo_types::Geometry as GtGeometry;
 use geohash::{decode_bbox, encode, neighbors};
@@ -17,9 +17,6 @@ fn polygon_to_geohashes(
     precision: usize,
     inner: bool,
 ) -> PyResult<HashSet<String>> {
-    let mut inner_geohashes = HashSet::new();
-    let mut outer_geohashes = HashSet::new();
-
     let mut polygons = Vec::<Polygon<f64>>::new();
 
     let geom: Geometry = match py_polygon.extract::<Geometry>() {
@@ -49,10 +46,14 @@ fn polygon_to_geohashes(
         return Err(pyo3::exceptions::PyValueError::new_err(e));
     }
 
-    for polygon in &polygons {
-        let envelope = polygon.bounding_rect().unwrap();
-        let poly_envelope = envelope.to_polygon();
+    // geohashes that will be returned as inside the polygon
+    let mut inner_geohashes = HashSet::new();
+    // geohashes that were looked at and are outside the polygon
+    let mut outer_geohashes = HashSet::new();
+    // geohashes that are candidates to be tested.
+    let mut candidate_geohashes = HashSet::new();
 
+    for polygon in &polygons {
         let centroid = polygon.centroid().unwrap();
         let centroid_geohash = encode((centroid.x(), centroid.y()).into(), precision)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{:?}", e)))?;
@@ -61,41 +62,31 @@ fn polygon_to_geohashes(
         testing_geohashes.push_back(centroid_geohash);
 
         while let Some(current_geohash) = testing_geohashes.pop_front() {
-            if !inner_geohashes.contains(&current_geohash)
-                && !outer_geohashes.contains(&current_geohash)
-            {
-                let rect_bbox = decode_bbox(&current_geohash)
-                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{:?}", e)))?;
-                let current_polygon = rect_bbox.to_polygon();
+            let rect_bbox = decode_bbox(&current_geohash)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{:?}", e)))?;
+            let current_polygon = rect_bbox.to_polygon();
 
-                let condition = if inner {
-                    poly_envelope.contains(&current_polygon)
-                } else {
-                    poly_envelope.intersects(&current_polygon)
-                };
-                if condition {
-                    if inner {
-                        if polygon.contains(&current_polygon) {
-                            inner_geohashes.insert(current_geohash.clone());
-                        } else {
-                            outer_geohashes.insert(current_geohash.clone());
-                        }
-                    } else {
-                        if polygon.intersects(&current_polygon) {
-                            inner_geohashes.insert(current_geohash.clone());
-                        } else {
-                            outer_geohashes.insert(current_geohash.clone());
-                        }
-                    }
+            let contains: bool = polygon.contains(&current_polygon);
+            let intersects: bool = match contains {
+                true => false,
+                false => polygon.intersects(&current_polygon),
+            };
+            let add_to_inner = contains || (!inner && intersects);
+            if add_to_inner {
+                inner_geohashes.insert(current_geohash.clone());
+            } else {
+                outer_geohashes.insert(current_geohash.clone());
+            }
 
-                    if let Ok(rez) = neighbors(&current_geohash) {
-                        for neighbor in [rez.sw, rez.s, rez.se, rez.w, rez.e, rez.nw, rez.n, rez.ne]
+            if add_to_inner || intersects {
+                if let Ok(rez) = neighbors(&current_geohash) {
+                    for neighbor in [rez.s, rez.w, rez.e, rez.n] {
+                        if (!inner_geohashes.contains(&neighbor)
+                            && !outer_geohashes.contains(&neighbor))
+                            && !candidate_geohashes.contains(&neighbor)
                         {
-                            if !inner_geohashes.contains(&neighbor)
-                                && !outer_geohashes.contains(&neighbor)
-                            {
-                                testing_geohashes.push_back(neighbor.to_string());
-                            }
+                            testing_geohashes.push_back(neighbor.clone());
+                            candidate_geohashes.insert(neighbor);
                         }
                     }
                 }
