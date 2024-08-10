@@ -79,7 +79,6 @@ fn polygon_to_geohashes(
             }
 
             if add_to_inner || intersects {
-                // polygon.intersects(&current_polygon) {
                 if let Ok(rez) = neighbors(&current_geohash) {
                     for neighbor in [rez.s, rez.w, rez.e, rez.n] {
                         if (!inner_geohashes.contains(&neighbor)
