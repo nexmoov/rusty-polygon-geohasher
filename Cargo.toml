@@ -1,6 +1,6 @@
 [package]
 name = "rusty-polygon-geohasher"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 authors = ["Francois Maillet <francois@locallogic.co>"]
 homepage = "https://github.com/nexmoov/rusty-polygon-geohasher"
