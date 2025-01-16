@@ -51,6 +51,7 @@ jobs:
       - name: pytest
         run: |
           pipx ensurepath
+          poetry self add poetry-plugin-export
           poetry export -f requirements.txt --with dev --output requirements.txt
           set -e
           python3 -m venv .venv
