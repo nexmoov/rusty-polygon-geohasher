@@ -4,7 +4,7 @@ version = "0.2.3"
 edition = "2021"
 authors = ["Francois Maillet <francois@locallogic.co>"]
 homepage = "https://github.com/nexmoov/rusty-polygon-geohasher"
-lisence = "MIT"
+license = "MIT"
 readme = "README.md"
 keywords=["polygon", "geohashes", "geospatial"]
 
