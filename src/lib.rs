@@ -46,7 +46,7 @@ where
 
             if fully_contained_only {
                 // try hard to avoid calling .contains
-                if polygon.unsigned_area() < current_geohash_polygon.unsigned_area()
+                if current_geohash_polygon.unsigned_area() > polygon.unsigned_area()
                     || polygon_exterior.intersects(current_geohash_polygon.exterior())
                     || polygon
                         .interiors()
