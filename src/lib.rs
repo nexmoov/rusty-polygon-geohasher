@@ -7,15 +7,18 @@ use pyo3::types::PyAny;
 use pyo3::wrap_pyfunction;
 use std::collections::{HashSet, VecDeque};
 
-fn polygons_to_geohashes(
-    polygons: Vec<Polygon>,
+pub fn polygons_to_geohashes<PI>(
+    polygons: PI,
     precision: usize,
     fully_contained_only: bool,
-) -> Result<HashSet<String>, GeohashError> {
+) -> Result<HashSet<String>, GeohashError>
+where
+    PI: IntoIterator<Item = Polygon>,
+{
     let mut accepted_geohashes = HashSet::new();
     let mut rejected_geohashes = HashSet::new();
 
-    for polygon in &polygons {
+    for polygon in polygons {
         let polygon_exterior = polygon.exterior();
 
         let centroid = polygon.centroid().unwrap();
@@ -41,7 +44,9 @@ fn polygons_to_geohashes(
             }
 
             if fully_contained_only {
-                if polygon_exterior.intersects(current_geohash_polygon.exterior())
+                // try hard to avoid calling .contains
+                if polygon.unsigned_area() < current_geohash_polygon.unsigned_area()
+                    || polygon_exterior.intersects(current_geohash_polygon.exterior())
                     || polygon
                         .interiors()
                         .iter()
