@@ -44,7 +44,12 @@ fn polygons_to_geohashes(
             }
 
             if fully_contained_only {
-                if polygon_exterior.intersects(current_geohash_polygon.exterior()) {
+                if polygon_exterior.intersects(current_geohash_polygon.exterior())
+                    || polygon
+                        .interiors()
+                        .iter()
+                        .any(|hole| hole.intersects(current_geohash_polygon.exterior()))
+                {
                     rejected_geohashes.insert(current_geohash.clone());
                 } else {
                     accepted_geohashes.insert(current_geohash.clone());
