@@ -1,13 +1,10 @@
-use geo::{
-    algorithm::{centroid::Centroid, contains::Contains},
-    BoundingRect, Intersects, Polygon,
-};
+use geo::{algorithm::centroid::Centroid, Intersects, Polygon};
 use geo_types::Geometry as GtGeometry;
 use geohash::{decode_bbox, encode, neighbors, GeohashError};
 use py_geo_interface::Geometry;
+use pyo3::prelude::*;
 use pyo3::types::PyAny;
 use pyo3::wrap_pyfunction;
-use pyo3::{exceptions::PyValueError, prelude::*};
 use std::collections::{HashSet, VecDeque};
 
 fn polygons_to_geohashes(
