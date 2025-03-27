@@ -13,13 +13,13 @@ use std::collections::{HashSet, VecDeque};
 fn polygons_to_geohashes(
     polygons: Vec<Polygon>,
     precision: usize,
-    inner: bool,
+    fully_contained_only: bool,
 ) -> Result<HashSet<String>, GeohashError> {
-    let mut inner_geohashes = HashSet::new();
-    let mut outer_geohashes = HashSet::new();
+    let mut accepted_geohashes = HashSet::new();
+    let mut rejected_geohashes = HashSet::new();
 
     for polygon in &polygons {
-        let envelope = polygon.bounding_rect().unwrap();
+        let polygon_exterior = polygon.exterior();
 
         let centroid = polygon.centroid().unwrap();
         let centroid_geohash = encode((centroid.x(), centroid.y()).into(), precision)?;
@@ -28,41 +28,35 @@ fn polygons_to_geohashes(
         testing_geohashes.push_back(centroid_geohash);
 
         while let Some(current_geohash) = testing_geohashes.pop_front() {
-            if inner_geohashes.contains(&current_geohash)
-                || outer_geohashes.contains(&current_geohash)
+            if accepted_geohashes.contains(&current_geohash)
+                || rejected_geohashes.contains(&current_geohash)
             {
                 continue;
             }
 
-            let rect_bbox = decode_bbox(&current_geohash)?;
-            let current_geohash_polygon = rect_bbox.to_polygon();
+            let gh_bbox = decode_bbox(&current_geohash)?;
+            let current_geohash_polygon = gh_bbox.to_polygon();
 
-            let condition = if inner {
-                envelope.contains(&rect_bbox)
-            } else {
-                envelope.intersects(&rect_bbox)
-            };
-            if !condition {
+            if !polygon.intersects(&current_geohash_polygon) {
+                // not intersecting or inside, reject
+                rejected_geohashes.insert(current_geohash.clone());
                 continue;
             }
 
-            if inner {
-                if polygon.contains(&current_geohash_polygon) {
-                    inner_geohashes.insert(current_geohash.clone());
+            if fully_contained_only {
+                if polygon_exterior.intersects(current_geohash_polygon.exterior()) {
+                    rejected_geohashes.insert(current_geohash.clone());
                 } else {
-                    outer_geohashes.insert(current_geohash.clone());
+                    accepted_geohashes.insert(current_geohash.clone());
                 }
             } else {
-                if polygon.intersects(&current_geohash_polygon) {
-                    inner_geohashes.insert(current_geohash.clone());
-                } else {
-                    outer_geohashes.insert(current_geohash.clone());
-                }
+                // it intersects, keep it
+                accepted_geohashes.insert(current_geohash.clone());
             }
-
             if let Ok(rez) = neighbors(&current_geohash) {
                 for neighbor in [rez.sw, rez.s, rez.se, rez.w, rez.e, rez.nw, rez.n, rez.ne] {
-                    if !inner_geohashes.contains(&neighbor) && !outer_geohashes.contains(&neighbor)
+                    if !accepted_geohashes.contains(&neighbor)
+                        && !rejected_geohashes.contains(&neighbor)
                     {
                         testing_geohashes.push_back(neighbor.to_string());
                     }
@@ -70,7 +64,7 @@ fn polygons_to_geohashes(
             }
         }
     }
-    Ok(inner_geohashes)
+    Ok(accepted_geohashes)
 }
 
 #[pyfunction]
