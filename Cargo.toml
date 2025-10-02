@@ -18,6 +18,9 @@ geo-types = "^0.7.13"
 
 [lib]
 name = "geohash_polygon"
+# The crate-type includes both "cdylib" and "rlib" to support multiple use cases:
+# - "cdylib" is required for creating a dynamic library for Python bindings using pyo3.
+# - "rlib" allows the crate to be used as a Rust library in other Rust projects.
 crate-type = ["cdylib", "rlib"]
 
 [features]
