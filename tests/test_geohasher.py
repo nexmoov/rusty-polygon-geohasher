@@ -113,3 +113,28 @@ def test_verdun(level, inner, polygon_verdun):
     assert geohash_polygon.polygon_to_geohashes(
         polygon_verdun, level, inner
     ) == polygon_to_geohashes_py(polygon_verdun, level, inner)
+
+
+@pytest.mark.parametrize(
+    "level, inner",
+    [
+        (1, False),
+        (1, True),
+        (2, False),
+        (2, True),
+        (3, False),
+        (3, True),
+        (4, False),
+        (4, True),
+        (5, False),
+        (5, True),
+        (6, False),
+        (6, True),
+        # (7, False),
+        # (7, True),
+    ],
+)
+def test_hole(level, inner, polygon_hole):
+    assert geohash_polygon.polygon_to_geohashes(
+        polygon_hole, level, inner
+    ) == polygon_to_geohashes_py(polygon_hole, level, inner)
