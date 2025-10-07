@@ -10,7 +10,7 @@ keywords=["polygon", "geohashes", "geospatial"]
 
 [dependencies]
 pyo3 = { version = "^0.21.0", features = ["extension-module", "abi3-py310"] }
-geo = "^0.29"
+geo = "^0.31"
 geohash = "^0.13.1"
 queue = "^0.3.1"
 py_geo_interface = "^0.8.0"

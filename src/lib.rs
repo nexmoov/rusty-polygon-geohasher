@@ -1,4 +1,6 @@
-use geo::{algorithm::centroid::Centroid, Area, BoundingRect, Contains, Intersects, Polygon};
+use geo::{
+    algorithm::centroid::Centroid, Area, BoundingRect, Contains, Intersects, Point, Polygon, Rect,
+};
 
 use geo_types::Geometry as GtGeometry;
 use geohash::{decode_bbox, encode, neighbors, GeohashError};
@@ -21,12 +23,19 @@ where
 
     for polygon in polygons {
         let polygon_exterior = polygon.exterior();
+        let has_holes = !polygon.interiors().is_empty();
 
-        let centroid = polygon.centroid().unwrap();
-        let centroid_geohash = encode((centroid.x(), centroid.y()).into(), precision)?;
+        // choose a seed inside the polygon
+        let seed_point = seed_interior_point_fast(&polygon).unwrap_or_else(|| {
+            // fallback if no interior found: use bbox center (rare)
+            let b = polygon.bounding_rect().unwrap();
+            Point::new((b.min().x + b.max().x) * 0.5, (b.min().y + b.max().y) * 0.5)
+        });
 
+        // convert to geohash and start BFS
         let mut testing_geohashes = VecDeque::new();
-        testing_geohashes.push_back(centroid_geohash);
+        let seed_gh = encode((seed_point.x(), seed_point.y()).into(), precision)?;
+        testing_geohashes.push_back(seed_gh);
 
         while let Some(current_geohash) = testing_geohashes.pop_front() {
             if accepted_geohashes.contains(&current_geohash)
@@ -38,29 +47,32 @@ where
             let gh_bbox = decode_bbox(&current_geohash)?;
             let current_geohash_polygon = gh_bbox.to_polygon();
 
+            // prune non-intersecting cells early and don't expand from them
             if !polygon.intersects(&current_geohash_polygon) {
-                // not intersecting or inside, reject
                 rejected_geohashes.insert(current_geohash.clone());
                 continue;
             }
 
-            if fully_contained_only {
-                // try hard to avoid calling .contains
-                if current_geohash_polygon.unsigned_area() > polygon.unsigned_area()
-                    || polygon_exterior.intersects(current_geohash_polygon.exterior())
-                    || polygon
-                        .interiors()
-                        .iter()
-                        .any(|hole| hole.intersects(current_geohash_polygon.exterior()))
-                {
-                    rejected_geohashes.insert(current_geohash.clone());
+            let accept = if fully_contained_only {
+                if has_holes {
+                    // robust path when holes exist
+                    polygon.contains(&current_geohash_polygon)
                 } else {
-                    accepted_geohashes.insert(current_geohash.clone());
+                    // fast path for hole-free polygons (strict containment)
+                    !polygon_exterior.intersects(current_geohash_polygon.exterior())
+                        && current_geohash_polygon.unsigned_area() <= polygon.unsigned_area()
                 }
             } else {
-                // it intersects, keep it
+                // intersecting is enough
+                true
+            };
+
+            if accept {
                 accepted_geohashes.insert(current_geohash.clone());
+            } else {
+                rejected_geohashes.insert(current_geohash.clone());
             }
+
             if let Ok(rez) = neighbors(&current_geohash) {
                 for neighbor in [rez.sw, rez.s, rez.se, rez.w, rez.e, rez.nw, rez.n, rez.ne] {
                     if !accepted_geohashes.contains(&neighbor)
@@ -185,4 +197,79 @@ fn polygon_to_geohashes(
 fn geohash_polygon(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(polygon_to_geohashes, m)?)?;
     Ok(())
+}
+
+/// Ultra-fast interior seed with no RNG, no runtime trig.
+/// Fixed set of offsets → tight upper bound on `contains` calls.
+pub fn seed_interior_point_fast(poly: &Polygon) -> Option<Point> {
+    let bbox: Rect = poly.bounding_rect()?;
+    let (minx, miny, maxx, maxy) = (bbox.min().x, bbox.min().y, bbox.max().x, bbox.max().y);
+    let bx = (maxx - minx).abs();
+    let by = (maxy - miny).abs();
+    let span = bx.max(by);
+
+    // 1) centroid
+    if let Some(c) = poly.centroid() {
+        if poly.contains(&c) {
+            return Some(c);
+        }
+
+        // 2) deterministic offsets around centroid (approximate unit circle, no trig)
+        // 12 directions × 2 radii = 24 probes. Change radii for stricter/looser search.
+        // Offsets are normalized-ish; we scale by bbox span to move off boundary.
+        const OFFS: &[(f64, f64)] = &[
+            // 12-direction star (clockwise), integer-friendly
+            (1.0, 0.0),
+            (0.866, 0.5),
+            (0.5, 0.866),
+            (0.0, 1.0),
+            (-0.5, 0.866),
+            (-0.866, 0.5),
+            (-1.0, 0.0),
+            (-0.866, -0.5),
+            (-0.5, -0.866),
+            (0.0, -1.0),
+            (0.5, -0.866),
+            (0.866, -0.5),
+        ];
+        // Very small step first to clear boundary noise; then a modest step
+        let r1 = (span * 1e-6).max(1e-9);
+        let r2 = span * 1e-4;
+
+        // Elliptical scaling helps thin polygons aligned to axes
+        let sx = if bx > 0.0 { 1.0 } else { 1.0 };
+        let sy = if by > 0.0 { 1.0 } else { 1.0 };
+
+        // Try r1 then r2
+        for &r in &[r1, r2] {
+            for &(dx, dy) in OFFS {
+                let p = Point::new(c.x() + dx * r * sx, c.y() + dy * r * sy);
+                if poly.contains(&p) {
+                    return Some(p);
+                }
+            }
+        }
+    }
+
+    // 3) bbox center
+    let center = Point::new((minx + maxx) * 0.5, (miny + maxy) * 0.5);
+    if poly.contains(&center) {
+        return Some(center);
+    }
+
+    // 4) tiny fixed 4×4 grid inside bbox (16 probes, deterministic)
+    let nx = 4usize;
+    let ny = 4usize;
+    let stepx = bx / ((nx as f64) + 1.0);
+    let stepy = by / ((ny as f64) + 1.0);
+    for ix in 1..=nx {
+        for iy in 1..=ny {
+            let p = Point::new(minx + stepx * ix as f64, miny + stepy * iy as f64);
+            if poly.contains(&p) {
+                return Some(p);
+            }
+        }
+    }
+
+    None
 }
