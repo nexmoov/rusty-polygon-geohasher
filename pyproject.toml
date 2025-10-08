@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "rusty-polygon-geohasher"
-version = "0.2.3"
+version = "0.3.0"
 description = "A Rust implementation of the polygon to geohash library"
 readme = "README.md"
 authors = ["Francois Maillet <francois@locallogic.co>"]
@@ -38,7 +38,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [tool.poetry.dependencies]
-python = "^3.10"
+python = "^3.11"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
