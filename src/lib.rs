@@ -237,8 +237,8 @@ pub fn seed_interior_point_fast(poly: &Polygon) -> Option<Point> {
         let r2 = span * 1e-4;
 
         // Elliptical scaling helps thin polygons aligned to axes
-        let sx = if bx > 0.0 { 1.0 } else { 1.0 };
-        let sy = if by > 0.0 { 1.0 } else { 1.0 };
+        let sx = if span > 0.0 { bx / span } else { 1.0 };
+        let sy = if span > 0.0 { by / span } else { 1.0 };
 
         // Try r1 then r2
         for &r in &[r1, r2] {
