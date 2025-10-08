@@ -21,13 +21,14 @@ package-mode = false
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.2"
 maturin = "^1.7.0"
-shapely = "^2.0.5"
+shapely = "2.0.7"
 ruff = "^0.5.5"
 pytest-benchmark = "^4.0.0"
 six = "^1.16.0"
 polygon-geohasher = "^0.0.1"
 
 pre-commit = "^3.8.0"
+ipdb = "^0.13.13"
 [tool.poetry.group.troubleshooting.dependencies]
 ipython = "^8.26.0"
 
