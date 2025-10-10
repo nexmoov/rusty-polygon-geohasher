@@ -26,13 +26,13 @@ ruff = "^0.5.5"
 pytest-benchmark = "^4.0.0"
 six = "^1.16.0"
 polygon-geohasher = "^0.0.1"
-
 pre-commit = "^3.8.0"
 ipdb = "^0.13.13"
+
 [tool.poetry.group.troubleshooting.dependencies]
 ipython = "^8.26.0"
-
 pandas = "^2.2.2"
+
 [build-system]
 requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
@@ -41,4 +41,4 @@ build-backend = "maturin"
 python = "^3.11"
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
+features = ["python"]

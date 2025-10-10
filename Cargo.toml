@@ -9,23 +9,39 @@ readme = "README.md"
 keywords=["polygon", "geohashes", "geospatial"]
 
 [dependencies]
-pyo3 = { version = "^0.21.2", features = ["extension-module", "abi3-py311"] }
 geo = "^0.31"
 geohash = "^0.13.1"
 queue = "^0.3.1"
 py_geo_interface = "^0.8.0"
 geo-types = "^0.7.13"
 
+
+
+# Make pyo3 optional
+pyo3 = { version = "^0.21.2", optional = true, features = ["abi3-py311"] }
+
 [lib]
 name = "geohash_polygon"
+# Default to rlib, override in feature
+crate-type = ["rlib"]
+
+[features]
+# Feature to build Python extension
+python = ["pyo3", "pyo3/extension-module"]
+default = []
+#crate-type = ["cdylib"]
+
+
+#[lib]
+#name = "geohash_polygon"
 # The crate-type includes both "cdylib" and "rlib" to support multiple use cases:
 # - "cdylib" is required for creating a dynamic library for Python bindings using pyo3.
 # - "rlib" allows the crate to be used as a Rust library in other Rust projects.
-crate-type = ["cdylib", "rlib"]
+#crate-type = ["cdylib", "rlib"]
 
-[features]
-extension-module = ["pyo3/extension-module"]
-default = ["extension-module"]
+#[features]
+##extension-module = ["pyo3/extension-module"]
+#default = ["extension-module"]
 
 [dev-dependencies]
 criterion = "0.5.1"

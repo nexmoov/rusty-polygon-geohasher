@@ -1,14 +1,15 @@
 use geo::{
     algorithm::centroid::Centroid, Area, BoundingRect, Contains, Intersects, Point, Polygon, Rect,
 };
-
-use geo_types::Geometry as GtGeometry;
 use geohash::{decode_bbox, encode, neighbors, GeohashError};
-use py_geo_interface::Geometry;
-use pyo3::prelude::*;
-use pyo3::types::PyAny;
-use pyo3::wrap_pyfunction;
 use std::collections::{HashSet, VecDeque};
+
+#[cfg(feature = "python")]
+use {
+    geo_types::Geometry as GtGeometry,
+    py_geo_interface::Geometry,
+    pyo3::{prelude::*, types::PyAny, wrap_pyfunction},
+};
 
 pub fn polygons_to_geohashes<PI>(
     polygons: PI,
@@ -33,8 +34,8 @@ where
         });
 
         // convert to geohash and start BFS
-        let mut testing_geohashes = VecDeque::new();
-        let seed_gh = encode((seed_point.x(), seed_point.y()).into(), precision)?;
+        let mut testing_geohashes: VecDeque<String> = VecDeque::new();
+        let seed_gh: String = encode((seed_point.x(), seed_point.y()).into(), precision)?;
         testing_geohashes.push_back(seed_gh);
 
         while let Some(current_geohash) = testing_geohashes.pop_front() {
@@ -78,7 +79,7 @@ where
                     if !accepted_geohashes.contains(&neighbor)
                         && !rejected_geohashes.contains(&neighbor)
                     {
-                        testing_geohashes.push_back(neighbor.to_string());
+                        testing_geohashes.push_back(neighbor);
                     }
                 }
             }
@@ -153,6 +154,7 @@ where
     Ok(inner_geohashes)
 }
 
+#[cfg(feature = "python")]
 #[pyfunction]
 fn polygon_to_geohashes(
     _py: Python,
@@ -193,6 +195,7 @@ fn polygon_to_geohashes(
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{:?}", e)))
 }
 
+#[cfg(feature = "python")]
 #[pymodule]
 fn geohash_polygon(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(polygon_to_geohashes, m)?)?;
