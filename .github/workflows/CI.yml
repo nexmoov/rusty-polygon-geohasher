@@ -75,11 +75,29 @@ jobs:
             target: aarch64
           - runner: ubuntu-latest
             target: armv7
+        duckdb_line: ["1.3", "1.4"]
+    env:
+      DUCKDB_EXTENSION_NAME: geohash
     steps:
       - uses: actions/checkout@v4
+        with: { submodules: true }
       - uses: actions/setup-python@v5
         with:
           python-version: 3.x
+      # --- Build the DuckDB extension for this minor line ---
+      - name: Build DuckDB extension
+        shell: bash
+        env:
+          DUCKDB_EXTENSION_MIN_DUCKDB_VERSION: v${{ matrix.duckdb_line }}
+        run: |
+          set -eux
+          # Build your cdylib (the pure DuckDB extension crate)
+          cd duckdb_extension
+          cargo build --release
+          mkdir -p rusty_polygon_geohasher/_duckdb/${{ matrix.duckdb_line }}/${{ matrix.platform.platdir }}
+          cp target/release/libgeohash_duckdb_ext.so \
+             rusty_polygon_geohasher/_duckdb/${{ matrix.duckdb_line }}/${{ matrix.platform.platdir }}/geohash.duckdb_extension
+      # --- Build the Python wheel (now bundling the extension binary above) ---
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -90,7 +108,7 @@ jobs:
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-linux-${{ matrix.platform.target }}
+          name: wheels-linux-${{ matrix.platform.target }}-duckdb-${{ matrix.duckdb_line }}
           path: dist
 
   musllinux:
