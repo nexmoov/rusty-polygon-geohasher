@@ -1184,6 +1184,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
+name = "polygon_geohasher"
+version = "0.1.0"
+dependencies = [
+ "duckdb",
+ "duckdb-loadable-macros",
+ "geo",
+ "geo-types",
+ "geozero",
+ "libduckdb-sys",
+ "rusty-polygon-geohasher",
+ "wkt 0.10.3",
+]
+
+[[package]]
 name = "portable-atomic"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1561,20 +1575,6 @@ dependencies = [
  "geohash",
  "py_geo_interface",
  "queue",
-]
-
-[[package]]
-name = "rusty_quack"
-version = "0.1.0"
-dependencies = [
- "duckdb",
- "duckdb-loadable-macros",
- "geo",
- "geo-types",
- "geozero",
- "libduckdb-sys",
- "rusty-polygon-geohasher",
- "wkt 0.10.3",
 ]
 
 [[package]]

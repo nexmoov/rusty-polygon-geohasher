@@ -1,5 +1,5 @@
 [package]
-name = "rusty_quack"
+name = "polygon_geohasher"
 version = "0.1.0"
 edition = "2021"
 
@@ -16,7 +16,7 @@ panic = "unwind"
 # src/wasm_lib.rs forwards to src/lib.rs so that we can change from cdylib
 # (that is needed while compiling natively) to staticlib (needed since the
 # actual linking will be done via emcc
-name = "rusty_quack"
+name = "polygon_geohasher"
 path = "src/wasm_lib.rs"
 crate-type = ["staticlib"]
 
