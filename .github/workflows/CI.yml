@@ -94,6 +94,7 @@ jobs:
           set -eux
           # Build your cdylib (the pure DuckDB extension crate)
           cd duckdb_extension
+          make configure
           make release
           mkdir -p rusty_polygon_geohasher/_duckdb/${{ matrix.duckdb_line }}/${{ matrix.platform.platdir }}
           cp build/release/polygon_geohasher.duckdb_extension \
