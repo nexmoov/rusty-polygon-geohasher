@@ -42,3 +42,9 @@ python = "^3.11"
 
 [tool.maturin]
 features = ["python"]
+python-source = "."
+# Include the binary payload folders in the wheel
+include = [
+  "rusty_polygon_geohasher/__init__.py",
+  "rusty_polygon_geohasher/_duckdb/**",
+]

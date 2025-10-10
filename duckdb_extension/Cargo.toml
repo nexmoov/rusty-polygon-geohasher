@@ -1,0 +1,31 @@
+[package]
+name = "polygon_geohasher"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+lto = true
+strip = true
+panic = "unwind"
+
+[[example]]
+# crate-type can't be (at the moment) be overriden for specific targets
+# src/wasm_lib.rs forwards to src/lib.rs so that we can change from cdylib
+# (that is needed while compiling natively) to staticlib (needed since the
+# actual linking will be done via emcc
+name = "polygon_geohasher"
+path = "src/wasm_lib.rs"
+crate-type = ["staticlib"]
+
+[dependencies]
+duckdb = { version = "1.4.0", features = ["vtab-loadable", "vscalar", "vtab-arrow"] }
+duckdb-loadable-macros = "0.1.10"
+libduckdb-sys = { version = "1.4.0", features = ["loadable-extension"] }
+wkt = { version = "0.10", features = ["geo-types"] }
+geo-types = "0.7"
+geo = { version = "0.31", features = ["use-proj"] }
+rusty-polygon-geohasher = { path = "../"}
+geozero = { version = "0.14.0", features = ["with-geo", "with-wkb", "with-wkt"] }
