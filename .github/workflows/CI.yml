@@ -92,9 +92,10 @@ jobs:
           TARGET_DUCKDB_VERSION: v${{ matrix.duckdb_line }}
         run: |
           set -eux
-          # Build your cdylib (the pure DuckDB extension crate)
           cd duckdb_extension
           make configure
+          mkdir -p build/release
+          mkdir -p target/release
           make release
           mkdir -p rusty_polygon_geohasher/_duckdb/${{ matrix.duckdb_line }}/${{ matrix.platform.platdir }}
           cp build/release/polygon_geohasher.duckdb_extension \
