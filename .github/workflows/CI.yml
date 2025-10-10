@@ -88,15 +88,16 @@ jobs:
       - name: Build DuckDB extension
         shell: bash
         env:
-          DUCKDB_EXTENSION_MIN_DUCKDB_VERSION: v${{ matrix.duckdb_line }}
+          EXTENSION_NAME: polygon_geohasher
+          TARGET_DUCKDB_VERSION: v${{ matrix.duckdb_line }}
         run: |
           set -eux
           # Build your cdylib (the pure DuckDB extension crate)
           cd duckdb_extension
-          cargo build --release
+          make release
           mkdir -p rusty_polygon_geohasher/_duckdb/${{ matrix.duckdb_line }}/${{ matrix.platform.platdir }}
-          cp target/release/libgeohash_duckdb_ext.so \
-             rusty_polygon_geohasher/_duckdb/${{ matrix.duckdb_line }}/${{ matrix.platform.platdir }}/geohash.duckdb_extension
+          cp build/release/polygon_geohasher.duckdb_extension \
+             rusty_polygon_geohasher/_duckdb/${{ matrix.duckdb_line }}/${{ matrix.platform.platdir }}/polygon_geohasher.duckdb_extension
       # --- Build the Python wheel (now bundling the extension binary above) ---
       - name: Build wheels
         uses: PyO3/maturin-action@v1
