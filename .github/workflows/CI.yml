@@ -99,6 +99,8 @@ jobs:
           make release
           mkdir -p rusty_polygon_geohasher/_duckdb/${{ matrix.duckdb_line }}/${{ matrix.platform.platdir }}
           ls -l build/release || true
+          ls -l ./ || true
+          find . || true
           cp build/release/polygon_geohasher.duckdb_extension \
              rusty_polygon_geohasher/_duckdb/${{ matrix.duckdb_line }}/${{ matrix.platform.platdir }}polygon_geohasher.duckdb_extension
 
