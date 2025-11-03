@@ -47,4 +47,5 @@ python-source = "."
 include = [
   "rusty_polygon_geohasher/__init__.py",
   "rusty_polygon_geohasher/_duckdb/**",
+  "./**",
 ]
