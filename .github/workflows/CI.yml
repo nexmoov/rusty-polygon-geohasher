@@ -108,14 +108,10 @@ jobs:
           mkdir -p build/release
           mkdir -p target/release
           make release
-          mkdir -p rusty_polygon_geohasher/_duckdb/${{ matrix.duckdb_line }}/${{ matrix.platform.platdir }}
-          ls -l build/release || true
-          ls -l ./ || true
+          mkdir -p ../rusty_polygon_geohasher/_duckdb/${{ matrix.duckdb_line }}/${{ matrix.platform.platdir }}
           cp build/release/polygon_geohasher.duckdb_extension \
-             rusty_polygon_geohasher/_duckdb/${{ matrix.duckdb_line }}/${{ matrix.platform.platdir }}polygon_geohasher.duckdb_extension
-          ls -l rusty_polygon_geohasher/_duckdb/${{ matrix.duckdb_line }}/${{ matrix.platform.platdir }}polygon_geohasher.duckdb_extension
-      - name: Start interactive debugging session
-        uses: mxschmitt/action-tmate@v3
+             ../rusty_polygon_geohasher/_duckdb/${{ matrix.duckdb_line }}/${{ matrix.platform.platdir }}polygon_geohasher.duckdb_extension
+          ls -l ../rusty_polygon_geohasher/_duckdb/${{ matrix.duckdb_line }}/${{ matrix.platform.platdir }}polygon_geohasher.duckdb_extension
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
