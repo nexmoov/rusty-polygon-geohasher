@@ -108,6 +108,20 @@ jobs:
           args: --release --out dist
           sccache: 'true'
           manylinux: auto
+
+      # (Optional) sanity check the wheel payload
+      - name: Inspect wheel contents
+        shell: bash
+        run: |
+          python - <<'PY'
+          import glob, zipfile
+          whl = sorted(glob.glob('dist/*.whl'))[-1]
+          print("Inspecting:", whl)
+          with zipfile.ZipFile(whl) as z:
+              for n in z.namelist():
+                  if "_duckdb/" in n:
+                      print("  ", n)
+          PY
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
