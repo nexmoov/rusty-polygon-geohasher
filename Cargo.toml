@@ -27,6 +27,7 @@ crate-type = ["rlib"]
 
 [features]
 # Feature to build Python extension
+name = "rusty-polygon-geohasher"
 python = ["pyo3", "pyo3/extension-module"]
 default = []
 #crate-type = ["cdylib"]
