@@ -39,6 +39,23 @@ def test_exception_when_malformed_geo_interface(polygon, expected_message):
         geohash_polygon.polygon_to_geohashes(polygon, 3, True)
 
 
+def test_multipolygon_regression_issue_18():
+    """Regression test for issue #18.
+
+    rejected_geohashes was shared across polygons in a multipolygon, so cells
+    rejected by the first polygon's BFS were permanently blacklisted and never
+    tested against subsequent polygons — causing geohashes like 'u6' to be
+    silently dropped from the result.
+    """
+    mp = shapely.from_wkt(
+        "MULTIPOLYGON ("
+        "((12.850269 52.752106, 11.850269 51.754758, 10.862241 49.754758, 13.862241 53.52106, 12.850269 52.752106)),"
+        "((14.850269 56.752106, 13.850269 55.754758, 12.862241 54.754758, 15.862241 57.52106, 14.850269 56.752106))"
+        ")"
+    )
+    assert geohash_polygon.polygon_to_geohashes(mp, 2, False) == {"u0", "u2", "u3", "u6"}
+
+
 @pytest.mark.parametrize(
     "polygon, exception_message_idx",
     [

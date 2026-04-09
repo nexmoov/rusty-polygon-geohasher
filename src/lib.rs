@@ -18,9 +18,11 @@ where
     PI: IntoIterator<Item = Polygon>,
 {
     let mut accepted_geohashes = HashSet::new();
-    let mut rejected_geohashes = HashSet::new();
 
     for polygon in polygons {
+        // Reset per polygon: a cell rejected by one polygon in a multipolygon
+        // must still be tested against the others.
+        let mut rejected_geohashes = HashSet::new();
         let polygon_exterior = polygon.exterior();
         let has_holes = !polygon.interiors().is_empty();
 
