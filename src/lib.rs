@@ -1,5 +1,6 @@
 use geo::{
-    algorithm::centroid::Centroid, Area, BoundingRect, Contains, Intersects, Point, Polygon, Rect,
+    algorithm::centroid::Centroid, Area, BoundingRect, Contains, InteriorPoint, Intersects, Point,
+    Polygon, Rect,
 };
 
 use geohash::{decode_bbox, encode, neighbors, GeohashError};
@@ -24,11 +25,9 @@ where
         let has_holes = !polygon.interiors().is_empty();
 
         // choose a seed inside the polygon
-        let seed_point = seed_interior_point_fast(&polygon).unwrap_or_else(|| {
-            // fallback if no interior found: use bbox center (rare)
-            let b = polygon.bounding_rect().unwrap();
-            Point::new((b.min().x + b.max().x) * 0.5, (b.min().y + b.max().y) * 0.5)
-        });
+        let Some(seed_point) = seed_interior_point_fast(&polygon) else {
+            continue; // degenerate polygon, skip
+        };
 
         // convert to geohash and start BFS
         let mut testing_geohashes = VecDeque::new();
@@ -312,5 +311,7 @@ pub fn seed_interior_point_fast(poly: &Polygon) -> Option<Point> {
         }
     }
 
-    None
+    // 5) guaranteed interior point from geo (handles thin/concave polygons where
+    //    all fast probes fall inside the hollow region)
+    poly.interior_point()
 }
