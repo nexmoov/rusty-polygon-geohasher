@@ -6,6 +6,39 @@ from polygon_geohasher.polygon_geohasher import (
 import pytest
 
 
+class _FakeGeo:
+    """Object that has __geo_interface__ but returns a malformed mapping."""
+
+    def __init__(self, geo_interface):
+        self.__geo_interface__ = geo_interface
+
+
+@pytest.mark.parametrize(
+    "polygon, expected_message",
+    [
+        (
+            _FakeGeo({"coordinates": []}),
+            r"missing the required 'type' key",
+        ),
+        (
+            _FakeGeo({"type": 42, "coordinates": []}),
+            r"'type' value must be a string",
+        ),
+        (
+            _FakeGeo({"type": "Polygon"}),
+            r"missing the required 'coordinates' key",
+        ),
+        (
+            _FakeGeo({"type": "Polygon", "coordinates": [[[0, 0], [1], [1, 1], [0, 0]]]}),
+            r"invalid coordinate at index 1",
+        ),
+    ],
+)
+def test_exception_when_malformed_geo_interface(polygon, expected_message):
+    with pytest.raises(ValueError, match=expected_message):
+        geohash_polygon.polygon_to_geohashes(polygon, 3, True)
+
+
 @pytest.mark.parametrize(
     "polygon, exception_message_idx",
     [
@@ -22,7 +55,7 @@ import pytest
 )
 def test_exception_when_invalid(polygon, exception_message_idx):
     exception_messages = [
-        r"Exception while trying to extract Geometry. This function requires a Shapely Polygon or MultiPolygon.*",
+        r"Object does not implement __geo_interface__. Expected a Shapely Polygon or MultiPolygon.*",
         r"The geometry is not a Polygon or MultiPolygon",
     ]
     with pytest.raises(
