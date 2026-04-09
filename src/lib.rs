@@ -2,9 +2,7 @@ use geo::{
     algorithm::centroid::Centroid, Area, BoundingRect, Contains, Intersects, Point, Polygon, Rect,
 };
 
-use geo_types::Geometry as GtGeometry;
 use geohash::{decode_bbox, encode, neighbors, GeohashError};
-use py_geo_interface::Geometry;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 use pyo3::wrap_pyfunction;
@@ -153,6 +151,46 @@ where
     Ok(inner_geohashes)
 }
 
+/// Walk a `__geo_interface__` coordinate ring (list of [x, y] pairs) into a LineString.
+fn extract_ring(ring: &Bound<'_, PyAny>) -> PyResult<geo_types::LineString<f64>> {
+    let mut coords = Vec::new();
+    for (i, item) in ring.try_iter()?.enumerate() {
+        let pair = item?;
+        let (x, y) = (|| -> PyResult<(f64, f64)> {
+            Ok((pair.get_item(0)?.extract()?, pair.get_item(1)?.extract()?))
+        })()
+        .map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "invalid coordinate at index {i}: expected [longitude, latitude]"
+            ))
+        })?;
+        coords.push(geo_types::Coord { x, y });
+    }
+    Ok(geo_types::LineString::new(coords))
+}
+
+/// Build a `Polygon` from a `__geo_interface__` coordinates value (list of rings).
+fn extract_polygon(coordinates: &Bound<'_, PyAny>) -> PyResult<Polygon<f64>> {
+    let mut iter = coordinates.try_iter()?;
+    let exterior = extract_ring(
+        &iter
+            .next()
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Polygon has no rings"))??,
+    )?;
+    let holes = iter
+        .map(|r| -> PyResult<_> { extract_ring(&r?) })
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok(Polygon::new(exterior, holes))
+}
+
+/// Build a `Vec<Polygon>` from a `__geo_interface__` MultiPolygon coordinates value.
+fn extract_multipolygon(coordinates: &Bound<'_, PyAny>) -> PyResult<Vec<Polygon<f64>>> {
+    coordinates
+        .try_iter()?
+        .map(|item| -> PyResult<_> { extract_polygon(&item?) })
+        .collect()
+}
+
 #[pyfunction]
 fn polygon_to_geohashes(
     _py: Python,
@@ -160,37 +198,40 @@ fn polygon_to_geohashes(
     precision: usize,
     inner: bool,
 ) -> PyResult<HashSet<String>> {
-    let mut polygons = Vec::<Polygon<f64>>::new();
+    let geo_interface = py_polygon.getattr("__geo_interface__").map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err(
+            "Object does not implement __geo_interface__. Expected a Shapely Polygon or MultiPolygon.",
+        )
+    })?;
 
-    let geom: Geometry = match py_polygon.extract::<Geometry>() {
-        Ok(geometry) => geometry,
-        Err(e) => {
+    let geom_type: String = geo_interface
+        .get_item("type")
+        .map_err(|_| pyo3::exceptions::PyValueError::new_err(
+            "__geo_interface__ mapping is missing the required 'type' key",
+        ))?
+        .extract()
+        .map_err(|_| pyo3::exceptions::PyValueError::new_err(
+            "__geo_interface__ 'type' value must be a string",
+        ))?;
+
+    let coordinates = geo_interface
+        .get_item("coordinates")
+        .map_err(|_| pyo3::exceptions::PyValueError::new_err(
+            "__geo_interface__ mapping is missing the required 'coordinates' key",
+        ))?;
+
+    let polygons = match geom_type.as_str() {
+        "Polygon" => vec![extract_polygon(&coordinates)?],
+        "MultiPolygon" => extract_multipolygon(&coordinates)?,
+        _ => {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Exception while trying to extract Geometry. This function requires a Shapely Polygon or MultiPolygon. ({:?})", e
-            )))
+                "The geometry is not a Polygon or MultiPolygon",
+            ))
         }
     };
 
-    if let Err(e) = {
-        match geom.0 {
-            GtGeometry::Polygon(polygon) => {
-                polygons.push(polygon);
-                Ok(())
-            }
-            GtGeometry::MultiPolygon(multipolygon) => {
-                for polygon in multipolygon {
-                    polygons.push(polygon);
-                }
-                Ok(())
-            }
-            _ => Err("The geometry is not a Polygon or MultiPolygon"),
-        }
-    } {
-        return Err(pyo3::exceptions::PyValueError::new_err(e));
-    }
-
     polygons_to_geohashes(polygons, precision, inner)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{:?}", e)))
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e:?}")))
 }
 
 #[pymodule]

@@ -1,6 +1,6 @@
 [package]
 name = "rusty-polygon-geohasher"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["Francois Maillet <francois@locallogic.co>"]
 homepage = "https://github.com/nexmoov/rusty-polygon-geohasher"
@@ -9,11 +9,10 @@ readme = "README.md"
 keywords=["polygon", "geohashes", "geospatial"]
 
 [dependencies]
-pyo3 = { version = "^0.21.2", features = ["extension-module", "abi3-py311"] }
-geo = "^0.31"
+pyo3 = { version = "^0.24.1", features = ["extension-module", "abi3-py311"] }
+geo = "^0.32"
 geohash = "^0.13.1"
 queue = "^0.3.1"
-py_geo_interface = "^0.8.0"
 geo-types = "^0.7.13"
 
 [lib]
