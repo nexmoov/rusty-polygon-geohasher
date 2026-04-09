@@ -151,6 +151,32 @@ def test_verdun(level, inner, polygon_verdun):
 @pytest.mark.parametrize(
     "level, inner",
     [
+        (3, False),
+        (3, True),
+        (4, False),
+        (4, True),
+        (5, False),
+        (5, True),
+    ],
+)
+def test_crescent(level, inner, polygon_crescent):
+    """Thin C-shaped polygon whose centroid is outside the polygon body.
+
+    Before the interior_point() fallback was added, seed_interior_point_fast
+    returned None and the caller fell back to the bbox center, which also lies
+    outside the ring, causing the BFS to return an empty set.
+    """
+    result = geohash_polygon.polygon_to_geohashes(polygon_crescent, level, inner)
+    reference = polygon_to_geohashes_py(polygon_crescent, level, inner)
+    assert result == reference
+    if not inner:
+        # The crescent ring is real geometry — intersecting mode must find cells.
+        assert len(result) > 0
+
+
+@pytest.mark.parametrize(
+    "level, inner",
+    [
         (1, False),
         (1, True),
         (2, False),
