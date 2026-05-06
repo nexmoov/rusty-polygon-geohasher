@@ -7,7 +7,78 @@ use geohash::{decode_bbox, encode, neighbors, GeohashError};
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 use pyo3::wrap_pyfunction;
+use rayon::prelude::*;
 use std::collections::{HashSet, VecDeque};
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Build a custom thread pool, or return `None` to use the global Rayon pool.
+///
+/// Call this *before* releasing the GIL so that pool-creation errors can be
+/// converted to Python exceptions while we still hold it.
+fn make_pool(num_threads: Option<usize>) -> PyResult<Option<rayon::ThreadPool>> {
+    match num_threads {
+        None => Ok(None),
+        Some(n) => rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build()
+            .map(Some)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
+    }
+}
+
+/// Run `f` on `pool`, or on the global Rayon pool if `pool` is `None`.
+///
+/// Call this *inside* `py.allow_threads` so the GIL is released while Rayon
+/// workers are running.
+fn run_with_pool<F, T>(pool: &Option<rayon::ThreadPool>, f: F) -> T
+where
+    F: FnOnce() -> T + Send,
+    T: Send,
+{
+    match pool {
+        None => f(),
+        Some(p) => p.install(f),
+    }
+}
+
+fn all_neighbors(hash: &str) -> Result<[String; 8], GeohashError> {
+    let nbrs = neighbors(hash)?;
+    Ok([nbrs.n, nbrs.ne, nbrs.e, nbrs.se, nbrs.s, nbrs.sw, nbrs.w, nbrs.nw])
+}
+
+/// BFS frontier expansion: expand a set of geohashes outward by `n_hops` steps.
+/// Returns an error if any hash in the input set is malformed.
+pub fn expand_geohash_set(
+    geohashes: &HashSet<String>,
+    n_hops: usize,
+) -> Result<HashSet<String>, GeohashError> {
+    let mut all = geohashes.clone();
+    // Initial frontier: input cells with at least one neighbor outside the set.
+    // Neighbour lookup here validates user-provided hashes.
+    let mut frontier: HashSet<String> = HashSet::new();
+    for gh in all.iter() {
+        let nbrs = all_neighbors(gh)?;
+        if nbrs.iter().any(|n| !all.contains(n)) {
+            frontier.insert(gh.clone());
+        }
+    }
+    for _ in 0..n_hops {
+        let mut new_frontier: HashSet<String> = HashSet::new();
+        for gh in &frontier {
+            for n in all_neighbors(gh)? {
+                if !all.contains(&n) {
+                    new_frontier.insert(n);
+                }
+            }
+        }
+        all.extend(new_frontier.iter().cloned());
+        frontier = new_frontier;
+    }
+    Ok(all)
+}
+
+// ── Polygon → geohash (existing) ─────────────────────────────────────────────
 
 pub fn polygons_to_geohashes<PI>(
     polygons: PI,
@@ -207,19 +278,23 @@ fn polygon_to_geohashes(
 
     let geom_type: String = geo_interface
         .get_item("type")
-        .map_err(|_| pyo3::exceptions::PyValueError::new_err(
-            "__geo_interface__ mapping is missing the required 'type' key",
-        ))?
+        .map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err(
+                "__geo_interface__ mapping is missing the required 'type' key",
+            )
+        })?
         .extract()
-        .map_err(|_| pyo3::exceptions::PyValueError::new_err(
-            "__geo_interface__ 'type' value must be a string",
-        ))?;
+        .map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err(
+                "__geo_interface__ 'type' value must be a string",
+            )
+        })?;
 
-    let coordinates = geo_interface
-        .get_item("coordinates")
-        .map_err(|_| pyo3::exceptions::PyValueError::new_err(
+    let coordinates = geo_interface.get_item("coordinates").map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err(
             "__geo_interface__ mapping is missing the required 'coordinates' key",
-        ))?;
+        )
+    })?;
 
     let polygons = match geom_type.as_str() {
         "Polygon" => vec![extract_polygon(&coordinates)?],
@@ -235,11 +310,219 @@ fn polygon_to_geohashes(
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e:?}")))
 }
 
+// ── Encode / decode ───────────────────────────────────────────────────────────
+
+/// Encode a single (lng, lat) coordinate to a geohash of the given precision.
+#[pyfunction]
+#[pyo3(name = "encode")]
+fn encode_py(lng: f64, lat: f64, precision: usize) -> PyResult<String> {
+    encode((lng, lat).into(), precision)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
+/// Encode parallel lists of longitudes and latitudes to geohashes (parallel).
+#[pyfunction]
+#[pyo3(signature = (lngs, lats, precision, num_threads=None))]
+fn encode_many(
+    py: Python<'_>,
+    lngs: Vec<f64>,
+    lats: Vec<f64>,
+    precision: usize,
+    num_threads: Option<usize>,
+) -> PyResult<Vec<String>> {
+    if lngs.len() != lats.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "lngs and lats must have the same length",
+        ));
+    }
+    let pool = make_pool(num_threads)?;
+    let raw: Vec<Result<String, GeohashError>> = py.allow_threads(|| {
+        run_with_pool(&pool, || {
+            lngs.into_par_iter()
+                .zip_eq(lats)
+                .map(|(lng, lat)| encode((lng, lat).into(), precision))
+                .collect()
+        })
+    });
+    raw.into_iter()
+        .map(|r| r.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string())))
+        .collect()
+}
+
+/// Decode a geohash to (lng, lat, lng_err, lat_err) — lng-first, matching encode convention.
+#[pyfunction]
+fn decode_exactly(hash_str: &str) -> PyResult<(f64, f64, f64, f64)> {
+    let bbox = decode_bbox(hash_str)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    let lat = (bbox.min().y + bbox.max().y) / 2.0;
+    let lng = (bbox.min().x + bbox.max().x) / 2.0;
+    let lat_err = (bbox.max().y - bbox.min().y) / 2.0;
+    let lng_err = (bbox.max().x - bbox.min().x) / 2.0;
+    Ok((lng, lat, lng_err, lat_err))
+}
+
+/// Decode a list of geohashes to (lng, lat) center pairs (parallel).
+#[pyfunction]
+#[pyo3(signature = (geohashes, num_threads=None))]
+fn decode_many(
+    py: Python<'_>,
+    geohashes: Vec<String>,
+    num_threads: Option<usize>,
+) -> PyResult<Vec<(f64, f64)>> {
+    let pool = make_pool(num_threads)?;
+    let raw: Vec<Result<(f64, f64), GeohashError>> = py.allow_threads(|| {
+        run_with_pool(&pool, || {
+            geohashes
+                .into_par_iter()
+                .map(|hash| {
+                    decode_bbox(&hash).map(|bbox| {
+                        let lat = (bbox.min().y + bbox.max().y) / 2.0;
+                        let lng = (bbox.min().x + bbox.max().x) / 2.0;
+                        (lng, lat)
+                    })
+                })
+                .collect()
+        })
+    });
+    raw.into_iter()
+        .map(|r| r.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string())))
+        .collect()
+}
+
+/// Decode a list of geohashes to (lng, lat, lng_err, lat_err) tuples (parallel).
+#[pyfunction]
+#[pyo3(signature = (geohashes, num_threads=None))]
+fn decode_many_exactly(
+    py: Python<'_>,
+    geohashes: Vec<String>,
+    num_threads: Option<usize>,
+) -> PyResult<Vec<(f64, f64, f64, f64)>> {
+    let pool = make_pool(num_threads)?;
+    let raw: Vec<Result<(f64, f64, f64, f64), GeohashError>> = py.allow_threads(|| {
+        run_with_pool(&pool, || {
+            geohashes
+                .into_par_iter()
+                .map(|hash| {
+                    decode_bbox(&hash).map(|bbox| {
+                        let lat = (bbox.min().y + bbox.max().y) / 2.0;
+                        let lng = (bbox.min().x + bbox.max().x) / 2.0;
+                        let lat_err = (bbox.max().y - bbox.min().y) / 2.0;
+                        let lng_err = (bbox.max().x - bbox.min().x) / 2.0;
+                        (lng, lat, lng_err, lat_err)
+                    })
+                })
+                .collect()
+        })
+    });
+    raw.into_iter()
+        .map(|r| r.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string())))
+        .collect()
+}
+
+// ── Geography expansion ───────────────────────────────────────────────────────
+
+fn n_hops_for(sample_hash: &str, expansion_m: f64) -> PyResult<usize> {
+    if !expansion_m.is_finite() || expansion_m < 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "expansion_m must be a finite non-negative number",
+        ));
+    }
+    let bbox = decode_bbox(sample_hash)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid geohash: {e}")))?;
+    let lat_center = (bbox.min().y + bbox.max().y) / 2.0;
+    let cell_height_m = (bbox.max().y - bbox.min().y) * 111_000.0;
+    let cell_width_m = (bbox.max().x - bbox.min().x) * 111_320.0 * lat_center.to_radians().cos();
+    let min_cell_m = cell_height_m.min(cell_width_m);
+    Ok((expansion_m / min_cell_m).ceil() as usize)
+}
+
+/// Expand a single group of geohashes outward by `expansion_m` metres.
+///
+/// The hop count is derived from the cell height of a sample hash, so it works
+/// for any precision level.
+#[pyfunction]
+fn expand_geohashes(py: Python<'_>, geohashes: Vec<String>, expansion_m: f64) -> PyResult<Vec<String>> {
+    if geohashes.is_empty() {
+        return Ok(vec![]);
+    }
+    let expected_len = geohashes.first().unwrap().len();
+    if geohashes.iter().any(|h| h.len() != expected_len) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "all geohashes must have the same precision",
+        ));
+    }
+    let n_hops = n_hops_for(geohashes.first().unwrap(), expansion_m)?;
+    let hash_set: HashSet<String> = geohashes.into_iter().collect();
+    py.allow_threads(|| expand_geohash_set(&hash_set, n_hops))
+        .map(|s| s.into_iter().collect())
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
+/// Expand multiple groups of geohashes outward by `expansion_m` metres.
+///
+/// Each input group is expanded independently. Output order matches input order —
+/// `result[i]` is the expanded version of `groups[i]`. Groups are processed in
+/// parallel across geographies via Rayon.
+///
+/// The hop count is derived per group from the cell height of the group's first
+/// hash, so groups at different precision levels are each handled correctly.
+#[pyfunction]
+fn expand_geohash_mapping(
+    py: Python<'_>,
+    groups: Vec<Vec<String>>,
+    expansion_m: f64,
+) -> PyResult<Vec<Vec<String>>> {
+    if groups.is_empty() {
+        return Ok(vec![]);
+    }
+    // Compute n_hops per group sequentially (fast, may raise PyErr) before releasing the GIL.
+    let n_hops_per_group: Vec<usize> = groups
+        .iter()
+        .map(|g| match g.first() {
+            Some(h) => {
+                let expected_len = h.len();
+                if g.iter().any(|gh| gh.len() != expected_len) {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "all geohashes in a group must have the same precision",
+                    ));
+                }
+                n_hops_for(h, expansion_m)
+            }
+            None => Ok(0),
+        })
+        .collect::<PyResult<_>>()?;
+
+    let raw: Vec<Result<Vec<String>, GeohashError>> = py.allow_threads(|| {
+        groups
+            .into_par_iter()
+            .zip(n_hops_per_group.into_par_iter())
+            .map(|(hashes, n_hops)| {
+                let hash_set: HashSet<String> = hashes.into_iter().collect();
+                expand_geohash_set(&hash_set, n_hops).map(|s| s.into_iter().collect())
+            })
+            .collect()
+    });
+    raw.into_iter()
+        .map(|r| r.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string())))
+        .collect()
+}
+
+// ── Module ────────────────────────────────────────────────────────────────────
+
 #[pymodule]
 fn geohash_polygon(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(polygon_to_geohashes, m)?)?;
+    m.add_function(wrap_pyfunction!(encode_py, m)?)?;
+    m.add_function(wrap_pyfunction!(encode_many, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_exactly, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_many, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_many_exactly, m)?)?;
+    m.add_function(wrap_pyfunction!(expand_geohashes, m)?)?;
+    m.add_function(wrap_pyfunction!(expand_geohash_mapping, m)?)?;
     Ok(())
 }
+
+// ── Interior seed (existing) ──────────────────────────────────────────────────
 
 /// Ultra-fast interior seed with no RNG, no runtime trig.
 /// Fixed set of offsets → tight upper bound on `contains` calls.

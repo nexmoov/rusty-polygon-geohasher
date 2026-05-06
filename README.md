@@ -4,26 +4,72 @@
 
 # rusty-polygon-geohasher
 
-Polygon Geohasher is an open source Python package for converting Shapely's polygons into a set of geohashes. It obtains the set of geohashes inside a polygon or geohashes that touch (intersect) the polygon.
+A Rust-backed Python library for geohash operations: converting Shapely polygons to geohash sets,
+encode/decode, and geography expansion. All compute-heavy paths use Rayon for parallelism.
 
-The library is based on the [polygon-geohasher](https://github.com/Bonsanto/polygon-geohasher) library which is implemented in pure python. The main difference is that this library is implemented in Rust, yielding a significant performance improvement.
+Originally based on [polygon-geohasher](https://github.com/Bonsanto/polygon-geohasher) (pure Python).
+
+The encode/decode functions are a maintained replacement for
+[pygeohash-fast](https://github.com/PadenZach/pygeohash-fast), which is no longer actively maintained.
 
 
 ## Installing
-You can get the library from the Python Package Index (PyPI) using pip:
 
-`$ pip install rusty-polygon-geohasher`
+```
+pip install rusty-polygon-geohasher
+```
 
 
 ## Usage
-Here are some simple examples:
+
+### Polygon → geohash set
 
 ```python
-from polygon_geohasher.polygon_geohasher import polygon_to_geohashes
+import geohash_polygon
 from shapely import geometry
 
 polygon = geometry.Polygon([(-99.1795917, 19.432134), (-99.1656847, 19.429034),
                             (-99.1776492, 19.414236), (-99.1795917, 19.432134)])
-inner_geohashes_polygon = geohash_polygon.polygon_to_geohashes(polygon, 7, inner=True)
-outer_geohashes_polygon = geohash_polygon.polygon_to_geohashes(polygon, 7, inner=False)
+
+inner = geohash_polygon.polygon_to_geohashes(polygon, precision=7, inner=True)
+outer = geohash_polygon.polygon_to_geohashes(polygon, precision=7, inner=False)
 ```
+
+### Encode / decode
+
+All functions use `(lng, lat)` order consistently — encode takes `(lng, lat)` and all decode
+functions return `(lng, lat, ...)`.
+
+```python
+# Single encode/decode
+h = geohash_polygon.encode(lng=-73.554, lat=45.508, precision=7)
+lng, lat, lng_err, lat_err = geohash_polygon.decode_exactly(h)
+
+# Batch (parallel via Rayon)
+hashes = geohash_polygon.encode_many(lngs=[...], lats=[...], precision=7)
+centers = geohash_polygon.decode_many(hashes)           # list of (lng, lat)
+exact   = geohash_polygon.decode_many_exactly(hashes)   # list of (lng, lat, lng_err, lat_err)
+
+# Optional thread count
+geohash_polygon.encode_many(lngs, lats, 7, num_threads=4)
+geohash_polygon.decode_many(hashes, num_threads=4)
+geohash_polygon.decode_many_exactly(hashes, num_threads=4)
+```
+
+### Expand geohash mappings
+
+Expand each geography's geohash set outward by a given distance in metres. Useful when you
+want to count or join points-of-interest slightly outside a geography's boundary.
+
+```python
+# Single group
+expanded = geohash_polygon.expand_geohashes(["f25dvz3", "f25dvz4", ...], expansion_m=500.0)
+
+# Multiple groups — result[i] is the expanded version of groups[i]
+groups = [["f25dvz3", "f25dvz4", ...], [...]]
+expanded_groups = geohash_polygon.expand_geohash_mapping(groups, expansion_m=500.0)
+```
+
+The hop count is derived from the minimum cell dimension (accounting for latitude-dependent cell
+width), so expansion is accurate in all directions including east/west at high latitudes. All
+hashes in a group must have the same precision. Geography expansion runs in parallel across groups.
