@@ -419,6 +419,107 @@ fn decode_many_exactly(
         .collect()
 }
 
+/// Serialize a bounding box as a little-endian WKB or EWKB polygon (1 ring, 5 points, closed).
+///
+/// Pass `srid: None` for plain WKB (93 bytes). Pass `srid: Some(s)` for EWKB (97 bytes),
+/// which sets the SRID flag (0x20000000) in the type field and inserts a 4-byte SRID.
+#[inline]
+fn serialize_bbox(xmin: f64, ymin: f64, xmax: f64, ymax: f64, srid: Option<u32>) -> Vec<u8> {
+    let capacity = if srid.is_some() { 97 } else { 93 };
+    let wkb_type = if srid.is_some() { 3u32 | 0x20000000u32 } else { 3u32 };
+    let mut buf = Vec::with_capacity(capacity);
+    buf.push(0x01u8);
+    buf.extend_from_slice(&wkb_type.to_le_bytes());
+    if let Some(s) = srid {
+        buf.extend_from_slice(&s.to_le_bytes());
+    }
+    buf.extend_from_slice(&1u32.to_le_bytes()); // number of rings
+    buf.extend_from_slice(&5u32.to_le_bytes()); // number of points (closed ring)
+    for (x, y) in [
+        (xmin, ymin),
+        (xmax, ymin),
+        (xmax, ymax),
+        (xmin, ymax),
+        (xmin, ymin), // close the ring
+    ] {
+        buf.extend_from_slice(&x.to_le_bytes());
+        buf.extend_from_slice(&y.to_le_bytes());
+    }
+    buf
+}
+
+fn geohashes_to_bytes(
+    geohashes: Vec<String>,
+    srid: Option<u32>,
+    pool: &Option<rayon::ThreadPool>,
+) -> Vec<Result<Vec<u8>, GeohashError>> {
+    run_with_pool(pool, || {
+        geohashes
+            .into_par_iter()
+            .map(|hash| {
+                decode_bbox(&hash).map(|bbox| {
+                    serialize_bbox(bbox.min().x, bbox.min().y, bbox.max().x, bbox.max().y, srid)
+                })
+            })
+            .collect()
+    })
+}
+
+fn into_py_wkb_results(raw: Vec<Result<Vec<u8>, GeohashError>>) -> PyResult<Vec<Vec<u8>>> {
+    raw.into_iter()
+        .map(|r| r.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string())))
+        .collect()
+}
+
+/// Parallel Rust core of `decode_many_to_wkb`, without PyO3 overhead.
+pub fn geohashes_to_wkb(
+    geohashes: Vec<String>,
+    pool: &Option<rayon::ThreadPool>,
+) -> Vec<Result<Vec<u8>, GeohashError>> {
+    geohashes_to_bytes(geohashes, None, pool)
+}
+
+/// Decode a list of geohashes to WKB polygon bytes representing their bounding boxes (parallel).
+///
+/// Each returned bytes value is a standard little-endian WKB polygon with one ring of five
+/// points (closed bounding box). Pass the result to `ST_GeomFromWKB` in DuckDB or PostGIS.
+#[pyfunction]
+#[pyo3(signature = (geohashes, num_threads=None))]
+fn decode_many_to_wkb(
+    py: Python<'_>,
+    geohashes: Vec<String>,
+    num_threads: Option<usize>,
+) -> PyResult<Vec<Vec<u8>>> {
+    let pool = make_pool(num_threads)?;
+    into_py_wkb_results(py.allow_threads(|| geohashes_to_wkb(geohashes, &pool)))
+}
+
+/// Parallel Rust core of `decode_many_to_ewkb`, without PyO3 overhead.
+pub fn geohashes_to_ewkb(
+    geohashes: Vec<String>,
+    srid: u32,
+    pool: &Option<rayon::ThreadPool>,
+) -> Vec<Result<Vec<u8>, GeohashError>> {
+    geohashes_to_bytes(geohashes, Some(srid), pool)
+}
+
+/// Decode a list of geohashes to EWKB polygon bytes with an embedded SRID (parallel).
+///
+/// Like `decode_many_to_wkb` but with a SRID embedded in the header, making the
+/// bytes suitable for direct insertion into PostGIS geometry columns without a
+/// separate `ST_SetSRID` call. `srid` defaults to 4326.
+#[pyfunction]
+#[pyo3(signature = (geohashes, srid=4326, num_threads=None))]
+fn decode_many_to_ewkb(
+    py: Python<'_>,
+    geohashes: Vec<String>,
+    srid: u32,
+    num_threads: Option<usize>,
+) -> PyResult<Vec<Vec<u8>>> {
+    let pool = make_pool(num_threads)?;
+    into_py_wkb_results(py.allow_threads(|| geohashes_to_ewkb(geohashes, srid, &pool)))
+}
+
 // ── Geography expansion ───────────────────────────────────────────────────────
 
 fn n_hops_for(sample_hash: &str, expansion_m: f64) -> PyResult<usize> {
@@ -517,9 +618,219 @@ fn geohash_polygon(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode_exactly, m)?)?;
     m.add_function(wrap_pyfunction!(decode_many, m)?)?;
     m.add_function(wrap_pyfunction!(decode_many_exactly, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_many_to_wkb, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_many_to_ewkb, m)?)?;
     m.add_function(wrap_pyfunction!(expand_geohashes, m)?)?;
     m.add_function(wrap_pyfunction!(expand_geohash_mapping, m)?)?;
     Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use geohash::decode_bbox;
+
+    fn read_f64_le(buf: &[u8], offset: usize) -> f64 {
+        f64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())
+    }
+
+    /// Parse a WKB or EWKB bbox polygon and return (xmin, ymin, xmax, ymax).
+    /// Pass `srid: None` for plain WKB, `srid: Some(s)` to also assert the embedded SRID.
+    fn parse_polygon_bbox(buf: &[u8], srid: Option<u32>) -> (f64, f64, f64, f64) {
+        let has_srid = srid.is_some();
+        let expected_len = if has_srid { 97 } else { 93 };
+        let expected_type = if has_srid { 3u32 | 0x20000000u32 } else { 3u32 };
+        // header: byte_order(1) + type(4) [+ srid(4)] + rings(4) + points(4)
+        let coord_offset = if has_srid { 17usize } else { 13usize };
+        assert_eq!(buf.len(), expected_len);
+        assert_eq!(buf[0], 0x01, "byte order must be little-endian");
+        assert_eq!(u32::from_le_bytes(buf[1..5].try_into().unwrap()), expected_type, "WKB type mismatch");
+        let mut offset = 5;
+        if let Some(expected_srid) = srid {
+            assert_eq!(u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()), expected_srid, "SRID mismatch");
+            offset += 4;
+        }
+        assert_eq!(u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()), 1, "ring count must be 1");
+        assert_eq!(u32::from_le_bytes(buf[offset + 4..offset + 8].try_into().unwrap()), 5, "point count must be 5");
+        // Points: (xmin,ymin), (xmax,ymin), (xmax,ymax), (xmin,ymax), (xmin,ymin)
+        (
+            read_f64_le(buf, coord_offset),      // xmin — point 0 x
+            read_f64_le(buf, coord_offset + 8),  // ymin — point 0 y
+            read_f64_le(buf, coord_offset + 16), // xmax — point 1 x
+            read_f64_le(buf, coord_offset + 40), // ymax — point 2 y
+        )
+    }
+
+    // ── serialize_bbox (WKB) ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_bbox_to_wkb_is_93_bytes() {
+        assert_eq!(serialize_bbox(0.0, 0.0, 1.0, 1.0, None).len(), 93);
+    }
+
+    #[test]
+    fn test_bbox_to_wkb_header() {
+        parse_polygon_bbox(&serialize_bbox(0.0, 0.0, 1.0, 1.0, None), None);
+    }
+
+    #[test]
+    fn test_bbox_to_wkb_coordinates() {
+        let (xmin, ymin, xmax, ymax) = (-73.5853_f64, 45.5017, -73.5702, 45.5098);
+        let (gx1, gy1, gx2, gy2) = parse_polygon_bbox(&serialize_bbox(xmin, ymin, xmax, ymax, None), None);
+        assert_eq!(gx1, xmin);
+        assert_eq!(gy1, ymin);
+        assert_eq!(gx2, xmax);
+        assert_eq!(gy2, ymax);
+    }
+
+    #[test]
+    fn test_bbox_to_wkb_ring_is_closed() {
+        let (xmin, ymin) = (-73.5853_f64, 45.5017_f64);
+        let wkb = serialize_bbox(xmin, ymin, -73.5702, 45.5098, None);
+        assert_eq!(read_f64_le(&wkb, 77), xmin); // point 4 x
+        assert_eq!(read_f64_le(&wkb, 85), ymin); // point 4 y
+    }
+
+    // ── geohashes_to_wkb (pure Rust core) ────────────────────────────────────
+
+    fn run(geohashes: Vec<&str>, num_threads: Option<usize>) -> Vec<Result<Vec<u8>, GeohashError>> {
+        let pool = num_threads.map(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().unwrap());
+        geohashes_to_wkb(geohashes.into_iter().map(String::from).collect(), &pool)
+    }
+
+    #[test]
+    fn test_geohashes_to_wkb_empty() {
+        assert!(run(vec![], None).is_empty());
+    }
+
+    #[test]
+    fn test_geohashes_to_wkb_single() {
+        let results = run(vec!["dpz8zzzz"], None);
+        assert_eq!(results.len(), 1);
+        let wkb = results.into_iter().next().unwrap().unwrap();
+        let expected = decode_bbox("dpz8zzzz").unwrap();
+        let (xmin, ymin, xmax, ymax) = parse_polygon_bbox(&wkb, None);
+        assert_eq!(xmin, expected.min().x);
+        assert_eq!(ymin, expected.min().y);
+        assert_eq!(xmax, expected.max().x);
+        assert_eq!(ymax, expected.max().y);
+    }
+
+    #[test]
+    fn test_geohashes_to_wkb_preserves_order() {
+        let geohashes = ["dr5ru7", "dpz8zzzz", "9q8yy9ve"];
+        let results = run(geohashes.to_vec(), None);
+        assert_eq!(results.len(), geohashes.len());
+        for (i, &hash) in geohashes.iter().enumerate() {
+            let wkb = results[i].as_ref().unwrap();
+            let expected = decode_bbox(hash).unwrap();
+            let (xmin, ymin, xmax, ymax) = parse_polygon_bbox(wkb, None);
+            assert_eq!(xmin, expected.min().x, "xmin mismatch at index {i} ({hash})");
+            assert_eq!(ymin, expected.min().y, "ymin mismatch at index {i} ({hash})");
+            assert_eq!(xmax, expected.max().x, "xmax mismatch at index {i} ({hash})");
+            assert_eq!(ymax, expected.max().y, "ymax mismatch at index {i} ({hash})");
+        }
+    }
+
+    #[test]
+    fn test_geohashes_to_wkb_custom_thread_pool() {
+        let results = run(vec!["dr5ru7", "dpz8zzzz"], Some(2));
+        assert_eq!(results.len(), 2);
+        for r in &results {
+            assert_eq!(r.as_ref().unwrap().len(), 93);
+        }
+    }
+
+    // ── serialize_bbox (EWKB) ────────────────────────────────────────────────
+
+    #[test]
+    fn test_bbox_to_ewkb_is_97_bytes() {
+        assert_eq!(serialize_bbox(0.0, 0.0, 1.0, 1.0, Some(4326)).len(), 97);
+    }
+
+    #[test]
+    fn test_bbox_to_ewkb_header() {
+        parse_polygon_bbox(&serialize_bbox(0.0, 0.0, 1.0, 1.0, Some(4326)), Some(4326));
+    }
+
+    #[test]
+    fn test_bbox_to_ewkb_coordinates() {
+        let (xmin, ymin, xmax, ymax) = (-73.5853_f64, 45.5017, -73.5702, 45.5098);
+        let (gx1, gy1, gx2, gy2) = parse_polygon_bbox(&serialize_bbox(xmin, ymin, xmax, ymax, Some(4326)), Some(4326));
+        assert_eq!(gx1, xmin);
+        assert_eq!(gy1, ymin);
+        assert_eq!(gx2, xmax);
+        assert_eq!(gy2, ymax);
+    }
+
+    #[test]
+    fn test_bbox_to_ewkb_ring_is_closed() {
+        let (xmin, ymin) = (-73.5853_f64, 45.5017_f64);
+        let ewkb = serialize_bbox(xmin, ymin, -73.5702, 45.5098, Some(4326));
+        assert_eq!(read_f64_le(&ewkb, 81), xmin); // point 4 x
+        assert_eq!(read_f64_le(&ewkb, 89), ymin); // point 4 y
+    }
+
+    // ── geohashes_to_ewkb (pure Rust core) ───────────────────────────────────
+
+    fn run_ewkb(
+        geohashes: Vec<&str>,
+        srid: u32,
+        num_threads: Option<usize>,
+    ) -> Vec<Result<Vec<u8>, GeohashError>> {
+        let pool = num_threads.map(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().unwrap());
+        geohashes_to_ewkb(geohashes.into_iter().map(String::from).collect(), srid, &pool)
+    }
+
+    #[test]
+    fn test_geohashes_to_ewkb_empty() {
+        assert!(run_ewkb(vec![], 4326, None).is_empty());
+    }
+
+    #[test]
+    fn test_geohashes_to_ewkb_single() {
+        let results = run_ewkb(vec!["dpz8zzzz"], 4326, None);
+        assert_eq!(results.len(), 1);
+        let ewkb = results.into_iter().next().unwrap().unwrap();
+        let expected = decode_bbox("dpz8zzzz").unwrap();
+        let (xmin, ymin, xmax, ymax) = parse_polygon_bbox(&ewkb, Some(4326));
+        assert_eq!(xmin, expected.min().x);
+        assert_eq!(ymin, expected.min().y);
+        assert_eq!(xmax, expected.max().x);
+        assert_eq!(ymax, expected.max().y);
+    }
+
+    #[test]
+    fn test_geohashes_to_ewkb_preserves_order() {
+        let geohashes = ["dr5ru7", "dpz8zzzz", "9q8yy9ve"];
+        let results = run_ewkb(geohashes.to_vec(), 4326, None);
+        assert_eq!(results.len(), geohashes.len());
+        for (i, &hash) in geohashes.iter().enumerate() {
+            let ewkb = results[i].as_ref().unwrap();
+            let expected = decode_bbox(hash).unwrap();
+            let (xmin, ymin, xmax, ymax) = parse_polygon_bbox(ewkb, Some(4326));
+            assert_eq!(xmin, expected.min().x, "xmin mismatch at index {i} ({hash})");
+            assert_eq!(ymin, expected.min().y, "ymin mismatch at index {i} ({hash})");
+            assert_eq!(xmax, expected.max().x, "xmax mismatch at index {i} ({hash})");
+            assert_eq!(ymax, expected.max().y, "ymax mismatch at index {i} ({hash})");
+        }
+    }
+
+    #[test]
+    fn test_geohashes_to_ewkb_custom_srid() {
+        let results = run_ewkb(vec!["dr5ru7"], 32632, None);
+        let ewkb = results.into_iter().next().unwrap().unwrap();
+        assert_eq!(u32::from_le_bytes(ewkb[5..9].try_into().unwrap()), 32632u32);
+    }
+
+    #[test]
+    fn test_geohashes_to_ewkb_invalid_geohash() {
+        let results = run(vec!["not-a-geohash!"], None);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_err());
+    }
 }
 
 // ── Interior seed (existing) ──────────────────────────────────────────────────
