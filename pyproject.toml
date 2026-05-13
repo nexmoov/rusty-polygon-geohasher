@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "rusty-polygon-geohasher"
-version = "0.5.0"
+version = "0.6.0"
 description = "A Rust implementation of the polygon to geohash library"
 readme = "README.md"
 authors = ["Francois Maillet <francois@locallogic.co>"]
@@ -19,20 +19,20 @@ classifiers = [
 package-mode = false
 
 [tool.poetry.group.dev.dependencies]
-pytest = "^8.3.2"
+pytest = "^9.0.3"
 maturin = "^1.7.0"
 shapely = "2.0.7"
 ruff = "^0.5.5"
 pytest-benchmark = "^4.0.0"
 six = "^1.16.0"
 polygon-geohasher = "^0.0.1"
-
 pre-commit = "^3.8.0"
 ipdb = "^0.13.13"
+
 [tool.poetry.group.troubleshooting.dependencies]
 ipython = "^8.26.0"
-
 pandas = "^2.2.2"
+
 [build-system]
 requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
