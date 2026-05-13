@@ -73,3 +73,23 @@ expanded_groups = geohash_polygon.expand_geohash_mapping(groups, expansion_m=500
 The hop count is derived from the minimum cell dimension (accounting for latitude-dependent cell
 width), so expansion is accurate in all directions including east/west at high latitudes. All
 hashes in a group must have the same precision. Geography expansion runs in parallel across groups.
+
+### WKB / EWKB output
+
+Convert geohash bounding boxes to binary WKB or EWKB polygons for direct use
+in DuckDB (`ST_GeomFromWKB`) or PostGIS geometry columns.
+
+```python
+hashes = ["f25dvz3", "f25dvz4", ...]
+
+# Plain WKB — 93 bytes per hash
+wkb_list = geohash_polygon.decode_many_to_wkb(hashes)
+
+# EWKB with embedded SRID — 97 bytes per hash (default srid=4326)
+ewkb_list = geohash_polygon.decode_many_to_ewkb(hashes)
+ewkb_list = geohash_polygon.decode_many_to_ewkb(hashes, srid=32632)
+
+# Optional thread count
+geohash_polygon.decode_many_to_wkb(hashes, num_threads=4)
+geohash_polygon.decode_many_to_ewkb(hashes, num_threads=4)
+```

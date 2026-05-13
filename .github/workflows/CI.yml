@@ -43,6 +43,8 @@ jobs:
         with:
           python-version: '3.13'  # 3.x now resolves to 3.14; no Shapely wheel yet
           cache: "poetry"
+      - name: Rust tests
+        run: cargo test
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
