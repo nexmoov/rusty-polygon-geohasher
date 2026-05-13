@@ -827,7 +827,7 @@ mod tests {
 
     #[test]
     fn test_geohashes_to_ewkb_invalid_geohash() {
-        let results = run(vec!["not-a-geohash!"], None);
+        let results = run_ewkb(vec!["not-a-geohash!"], 4326, None);
         assert_eq!(results.len(), 1);
         assert!(results[0].is_err());
     }

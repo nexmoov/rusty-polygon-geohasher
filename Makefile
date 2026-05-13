@@ -2,7 +2,7 @@
 
 .PHONY: test
 test:
-	poetry run maturin develop -r && poetry run pytest tests
+	cargo test && poetry run maturin develop -r && poetry run pytest tests
 
 
 .PHONY: format

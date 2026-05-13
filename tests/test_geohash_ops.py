@@ -1,6 +1,7 @@
 """Tests for encode, decode_exactly, decode_many, encode_many, expand_geohash_mapping."""
 
 import math
+import struct
 import pytest
 import geohash_polygon
 
@@ -310,3 +311,101 @@ def test_expand_mapping_two_groups_are_independent():
     assert len(result[0]) == 9
     assert len(result[1]) == 9
     assert set(result[0]).isdisjoint(set(result[1]))
+
+
+# ── decode_many_to_wkb / decode_many_to_ewkb ─────────────────────────────────
+
+def test_decode_many_to_wkb_returns_bytes():
+    h = geohash_polygon.encode(-73.554, 45.508, 7)
+    results = geohash_polygon.decode_many_to_wkb([h])
+    assert len(results) == 1
+    assert isinstance(results[0], bytes)
+    assert len(results[0]) == 93
+
+
+def test_decode_many_to_wkb_invalid_raises():
+    with pytest.raises(ValueError):
+        geohash_polygon.decode_many_to_wkb(["not_a_geohash!"])
+
+
+def test_decode_many_to_wkb_order_preserved():
+    hashes = [geohash_polygon.encode(-73.554 + i * 0.002, 45.508, 7) for i in range(3)]
+    results = geohash_polygon.decode_many_to_wkb(hashes)
+    for h, wkb in zip(hashes, results):
+        lng, lat, lng_err, lat_err = geohash_polygon.decode_exactly(h)
+        xmin = struct.unpack_from("<d", wkb, 13)[0]
+        ymin = struct.unpack_from("<d", wkb, 21)[0]
+        xmax = struct.unpack_from("<d", wkb, 29)[0]
+        ymax = struct.unpack_from("<d", wkb, 53)[0]
+        assert abs(xmin - (lng - lng_err)) < 1e-10, f"xmin mismatch for {h}"
+        assert abs(ymin - (lat - lat_err)) < 1e-10, f"ymin mismatch for {h}"
+        assert abs(xmax - (lng + lng_err)) < 1e-10, f"xmax mismatch for {h}"
+        assert abs(ymax - (lat + lat_err)) < 1e-10, f"ymax mismatch for {h}"
+
+
+def test_decode_many_to_wkb_with_explicit_threads():
+    hashes = [geohash_polygon.encode(-73.554 + i * 0.001, 45.508 + i * 0.001, 7) for i in range(10)]
+    r1 = geohash_polygon.decode_many_to_wkb(hashes, num_threads=1)
+    r4 = geohash_polygon.decode_many_to_wkb(hashes, num_threads=4)
+    assert r1 == r4
+
+
+def test_decode_many_to_ewkb_returns_bytes():
+    h = geohash_polygon.encode(-73.554, 45.508, 7)
+    results = geohash_polygon.decode_many_to_ewkb([h])
+    assert len(results) == 1
+    assert isinstance(results[0], bytes)
+    assert len(results[0]) == 97
+
+
+def test_decode_many_to_ewkb_srid_default_4326():
+    h = geohash_polygon.encode(-73.554, 45.508, 7)
+    ewkb = geohash_polygon.decode_many_to_ewkb([h])[0]
+    srid = struct.unpack_from("<I", ewkb, 5)[0]
+    assert srid == 4326
+
+
+def test_decode_many_to_ewkb_custom_srid():
+    h = geohash_polygon.encode(-73.554, 45.508, 7)
+    ewkb = geohash_polygon.decode_many_to_ewkb([h], srid=32632)[0]
+    srid = struct.unpack_from("<I", ewkb, 5)[0]
+    assert srid == 32632
+
+
+def test_decode_many_to_ewkb_invalid_raises():
+    with pytest.raises(ValueError):
+        geohash_polygon.decode_many_to_ewkb(["not_a_geohash!"])
+
+
+def test_decode_many_to_wkb_roundtrip():
+    from shapely.wkb import loads
+    h = geohash_polygon.encode(-73.554, 45.508, 7)
+    wkb = geohash_polygon.decode_many_to_wkb([h])[0]
+    polygon = loads(wkb)
+    result = geohash_polygon.polygon_to_geohashes(polygon, precision=7, inner=False)
+    assert h in result
+
+
+@pytest.mark.parametrize("precision", [5, 6, 7, 8])
+def test_decode_many_to_wkb_roundtrip_precision(precision):
+    from shapely.wkb import loads
+    h = geohash_polygon.encode(-73.554, 45.508, precision)
+    wkb = geohash_polygon.decode_many_to_wkb([h])[0]
+    polygon = loads(wkb)
+    result = geohash_polygon.polygon_to_geohashes(polygon, precision=precision, inner=False)
+    assert h in result
+
+
+def test_decode_many_to_wkb_roundtrip_cluster():
+    # A single-cell round-trip only exercises a convex rectangle. Unioning 9
+    # adjacent cells produces a non-trivial polygon where interior-point
+    # detection and BFS seeding are exercised along shared edges — a failure
+    # mode that a lone bbox test would miss entirely.
+    from shapely.wkb import loads
+    from shapely.ops import unary_union
+    center = geohash_polygon.encode(-73.554, 45.508, 6)
+    cluster = geohash_polygon.expand_geohashes([center], 100.0)  # 1 hop → 9 cells
+    wkb_list = geohash_polygon.decode_many_to_wkb(cluster)
+    union = unary_union([loads(w) for w in wkb_list])
+    result = set(geohash_polygon.polygon_to_geohashes(union, precision=6, inner=False))
+    assert set(cluster).issubset(result)
