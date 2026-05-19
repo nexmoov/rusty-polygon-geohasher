@@ -20,5 +20,7 @@ poetry run pytest tests            # Python tests
 ## Structure
 
 - `src/lib.rs` — all Rust source and PyO3 bindings
+- `geohash_polygon/__init__.pyi` — type stub for the Python package; **must be kept in sync with `src/lib.rs`** when adding, removing, or changing any `#[pyfunction]` signature
+- `geohash_polygon/__init__.py` — package init that re-exports from the compiled extension
 - `tests/` — Python tests (require compiled extension)
 - `benches/` — criterion benchmarks

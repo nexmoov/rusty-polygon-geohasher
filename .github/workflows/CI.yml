@@ -60,8 +60,9 @@ jobs:
           source .venv/bin/activate
           pip install -r requirements.txt
           pip install rusty_polygon_geohasher --find-links dist --force-reinstall
-          pip install pytest
+          pip install pytest mypy
           pytest
+          mypy --strict geohash_polygon/__init__.pyi
 
   linux:
     needs: [tests]
