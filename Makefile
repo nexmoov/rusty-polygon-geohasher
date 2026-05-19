@@ -4,6 +4,10 @@
 test:
 	cargo test && poetry run maturin develop -r && poetry run pytest tests
 
+.PHONY: check-stubs
+check-stubs:
+	poetry run mypy --strict geohash_polygon/__init__.pyi
+
 
 .PHONY: format
 format: ## Format the code
