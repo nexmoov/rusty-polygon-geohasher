@@ -3,12 +3,16 @@ use geo::{
     Polygon, Rect,
 };
 
+use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StringArray};
+use arrow_array::builder::LargeStringBuilder;
+use arrow_schema::{DataType, Field, Schema};
 use geohash::{decode_bbox, encode, neighbors, GeohashError};
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 use pyo3::wrap_pyfunction;
 use rayon::prelude::*;
 use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -29,7 +33,7 @@ fn make_pool(num_threads: Option<usize>) -> PyResult<Option<rayon::ThreadPool>> 
 
 /// Run `f` on `pool`, or on the global Rayon pool if `pool` is `None`.
 ///
-/// Call this *inside* `py.allow_threads` so the GIL is released while Rayon
+/// Call this *inside* `py.detach` so the GIL is released while Rayon
 /// workers are running.
 fn run_with_pool<F, T>(pool: &Option<rayon::ThreadPool>, f: F) -> T
 where
@@ -336,7 +340,7 @@ fn encode_many(
         ));
     }
     let pool = make_pool(num_threads)?;
-    let raw: Vec<Result<String, GeohashError>> = py.allow_threads(|| {
+    let raw: Vec<Result<String, GeohashError>> = py.detach(|| {
         run_with_pool(&pool, || {
             lngs.into_par_iter()
                 .zip_eq(lats)
@@ -370,7 +374,7 @@ fn decode_many(
     num_threads: Option<usize>,
 ) -> PyResult<Vec<(f64, f64)>> {
     let pool = make_pool(num_threads)?;
-    let raw: Vec<Result<(f64, f64), GeohashError>> = py.allow_threads(|| {
+    let raw: Vec<Result<(f64, f64), GeohashError>> = py.detach(|| {
         run_with_pool(&pool, || {
             geohashes
                 .into_par_iter()
@@ -398,7 +402,7 @@ fn decode_many_exactly(
     num_threads: Option<usize>,
 ) -> PyResult<Vec<(f64, f64, f64, f64)>> {
     let pool = make_pool(num_threads)?;
-    let raw: Vec<Result<(f64, f64, f64, f64), GeohashError>> = py.allow_threads(|| {
+    let raw: Vec<Result<(f64, f64, f64, f64), GeohashError>> = py.detach(|| {
         run_with_pool(&pool, || {
             geohashes
                 .into_par_iter()
@@ -491,7 +495,7 @@ fn decode_many_to_wkb(
     num_threads: Option<usize>,
 ) -> PyResult<Vec<Vec<u8>>> {
     let pool = make_pool(num_threads)?;
-    into_py_wkb_results(py.allow_threads(|| geohashes_to_wkb(geohashes, &pool)))
+    into_py_wkb_results(py.detach(|| geohashes_to_wkb(geohashes, &pool)))
 }
 
 /// Parallel Rust core of `decode_many_to_ewkb`, without PyO3 overhead.
@@ -517,7 +521,7 @@ fn decode_many_to_ewkb(
     num_threads: Option<usize>,
 ) -> PyResult<Vec<Vec<u8>>> {
     let pool = make_pool(num_threads)?;
-    into_py_wkb_results(py.allow_threads(|| geohashes_to_ewkb(geohashes, srid, &pool)))
+    into_py_wkb_results(py.detach(|| geohashes_to_ewkb(geohashes, srid, &pool)))
 }
 
 // ── Geography expansion ───────────────────────────────────────────────────────
@@ -554,7 +558,7 @@ fn expand_geohashes(py: Python<'_>, geohashes: Vec<String>, expansion_m: f64) ->
     }
     let n_hops = n_hops_for(geohashes.first().unwrap(), expansion_m)?;
     let hash_set: HashSet<String> = geohashes.into_iter().collect();
-    py.allow_threads(|| expand_geohash_set(&hash_set, n_hops))
+    py.detach(|| expand_geohash_set(&hash_set, n_hops))
         .map(|s| s.into_iter().collect())
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
 }
@@ -593,7 +597,7 @@ fn expand_geohash_mapping(
         })
         .collect::<PyResult<_>>()?;
 
-    let raw: Vec<Result<Vec<String>, GeohashError>> = py.allow_threads(|| {
+    let raw: Vec<Result<Vec<String>, GeohashError>> = py.detach(|| {
         groups
             .into_par_iter()
             .zip(n_hops_per_group.into_par_iter())
@@ -606,6 +610,149 @@ fn expand_geohash_mapping(
     raw.into_iter()
         .map(|r| r.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string())))
         .collect()
+}
+
+/// Expand multiple groups of geohashes outward by `expansion_m` metres, passing data as Arrow
+/// arrays to avoid Python object allocation at the boundary.
+///
+/// Accepts two PyArrow `Array` objects (not ChunkedArray — call `.combine_chunks()` first):
+///   - `geog_ids`: a Utf8 `StringArray` of N geog_id strings
+///   - `geohash_lists`: a `List<Utf8>` array where element `i` holds the geohashes for geog `i`
+///
+/// Returns a flat PyArrow `RecordBatch` with schema `(geog_id: LargeUtf8, geohash: LargeUtf8)` —
+/// one row per (geog_id, expanded_geohash) pair, with geog_ids repeated as needed.
+///
+/// Compared to `expand_geohash_mapping`, this function eliminates the Python str object
+/// round-trip: strings are read directly from Arrow buffers and the output is built into
+/// Arrow buffers without touching the Python heap at all.
+#[pyfunction]
+fn expand_geohash_mapping_arrow(
+    py: Python<'_>,
+    geog_ids: pyo3_arrow::PyArray,
+    geohash_lists: pyo3_arrow::PyArray,
+    expansion_m: f64,
+) -> PyResult<pyo3_arrow::PyRecordBatch> {
+    if !expansion_m.is_finite() || expansion_m < 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "expansion_m must be a finite non-negative number",
+        ));
+    }
+
+    let (geog_id_ref, _) = geog_ids.into_inner();
+    let (geohash_list_ref, _) = geohash_lists.into_inner();
+
+    let geog_id_arr = geog_id_ref
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("geog_ids must be a Utf8 Array"))?;
+
+    let list_arr = geohash_list_ref
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("geohash_lists must be a List<Utf8> Array")
+        })?;
+
+    let values_arr = list_arr
+        .values()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("geohash list element type must be Utf8")
+        })?;
+
+    let n = geog_id_arr.len();
+    if list_arr.len() != n {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "geog_ids and geohash_lists must have the same length",
+        ));
+    }
+    if let Some(i) = (0..n).find(|&i| geog_id_arr.is_null(i)) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "geog_ids contains a null at index {i}"
+        )));
+    }
+    let offsets = list_arr.offsets();
+
+    // Compute n_hops per group while holding the GIL (n_hops_for can raise PyErr).
+    let n_hops_per_group: Vec<usize> = (0..n)
+        .map(|i| {
+            let start = offsets[i] as usize;
+            let end = offsets[i + 1] as usize;
+            if start == end {
+                return Ok(0);
+            }
+            let first = values_arr.value(start);
+            let expected_len = first.len();
+            if (start + 1..end).any(|j| values_arr.value(j).len() != expected_len) {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "all geohashes in a group must have the same precision",
+                ));
+            }
+            n_hops_for(first, expansion_m)
+        })
+        .collect::<PyResult<_>>()?;
+
+    // Clone strings from Arrow buffers into owned Strings. Reading from Arrow's UTF-8
+    // buffer is ~5× faster than going through to_pylist() + PyO3 str conversion, since
+    // it skips the CPython object layer entirely.
+    let groups: Vec<(String, Vec<String>, usize)> = (0..n)
+        .map(|i| {
+            let geog_id = geog_id_arr.value(i).to_owned();
+            let start = offsets[i] as usize;
+            let end = offsets[i + 1] as usize;
+            let hashes: Vec<String> =
+                (start..end).map(|j| values_arr.value(j).to_owned()).collect();
+            (geog_id, hashes, n_hops_per_group[i])
+        })
+        .collect();
+
+    // Release the GIL and expand all groups in parallel via Rayon.
+    let results: Vec<(String, Result<HashSet<String>, GeohashError>)> =
+        py.detach(|| {
+            groups
+                .into_par_iter()
+                .map(|(geog_id, hashes, n_hops)| {
+                    let hash_set: HashSet<String> = hashes.into_iter().collect();
+                    (geog_id, expand_geohash_set(&hash_set, n_hops))
+                })
+                .collect()
+        });
+
+    // Count output rows so we can pre-allocate Arrow builders exactly once.
+    let total_out: usize = results
+        .iter()
+        .map(|(_, r)| r.as_ref().map_or(0, |s| s.len()))
+        .sum();
+
+    // Build flat Arrow output directly in Rust — no Python str objects, no flatten loop,
+    // no pa.array() round-trip.
+    let mut out_geog_ids = LargeStringBuilder::with_capacity(total_out, total_out * 20);
+    let mut out_geohashes = LargeStringBuilder::with_capacity(total_out, total_out * 7);
+
+    for (geog_id, expanded) in results {
+        let expanded =
+            expanded.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        for geohash in expanded {
+            out_geog_ids.append_value(&geog_id);
+            out_geohashes.append_value(&geohash);
+        }
+    }
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("geog_id", DataType::LargeUtf8, false),
+        Field::new("geohash", DataType::LargeUtf8, false),
+    ]));
+
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(out_geog_ids.finish()),
+        Arc::new(out_geohashes.finish()),
+    ];
+
+    let batch = RecordBatch::try_new(schema, columns)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+    Ok(pyo3_arrow::PyRecordBatch::new(batch))
 }
 
 // ── Module ────────────────────────────────────────────────────────────────────
@@ -622,6 +769,7 @@ fn geohash_polygon(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode_many_to_ewkb, m)?)?;
     m.add_function(wrap_pyfunction!(expand_geohashes, m)?)?;
     m.add_function(wrap_pyfunction!(expand_geohash_mapping, m)?)?;
+    m.add_function(wrap_pyfunction!(expand_geohash_mapping_arrow, m)?)?;
     Ok(())
 }
 

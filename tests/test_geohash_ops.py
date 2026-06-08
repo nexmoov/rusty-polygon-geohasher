@@ -303,6 +303,7 @@ def test_expand_mapping_mixed_precisions():
     assert len(result[1]) > 9       # p7: many more hops
 
 
+
 def test_expand_mapping_two_groups_are_independent():
     # Two groups far apart should expand independently with no crosstalk.
     h1 = geohash_polygon.encode(-73.5540, 45.5088, 7)  # Montreal

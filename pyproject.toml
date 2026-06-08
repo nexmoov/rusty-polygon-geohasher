@@ -40,6 +40,10 @@ build-backend = "maturin"
 
 [tool.poetry.dependencies]
 python = "^3.11"
+pyarrow = { version = "^24.0.0", optional = true }
+
+[tool.poetry.extras]
+arrow = ["pyarrow"]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
