@@ -47,3 +47,17 @@ def expand_geohash_mapping(
     groups: list[list[str]],
     expansion_m: float,
 ) -> list[list[str]]: ...
+
+def expand_geohash_mapping_arrow(
+    geog_ids: Any,
+    geohash_lists: Any,
+    expansion_m: float,
+) -> Any:
+    """Expand geohash groups using Arrow arrays for zero-copy I/O.
+
+    geog_ids: pyarrow Utf8 Array (single chunk — call .combine_chunks() first)
+    geohash_lists: pyarrow List<Utf8> Array (single chunk)
+    Returns a RecordBatch with schema (geog_id: LargeUtf8, geohash: LargeUtf8).
+    Convert to pyarrow via pa.record_batch(result).
+    """
+    ...
