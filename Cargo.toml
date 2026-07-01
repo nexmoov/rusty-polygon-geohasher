@@ -9,10 +9,10 @@ readme = "README.md"
 keywords=["polygon", "geohashes", "geospatial"]
 
 [dependencies]
-pyo3 = { version = "^0.28.0", features = ["extension-module", "abi3-py311"] }
-pyo3-arrow = "0.17"
-arrow-array = { version = "58", default-features = false }
-arrow-schema = { version = "58", default-features = false }
+pyo3 = { version = "^0.29.0", features = ["extension-module", "abi3-py311"] }
+pyo3-arrow = "0.19"
+arrow-array = { version = "59", default-features = false }
+arrow-schema = { version = "59", default-features = false }
 geo = "^0.33"
 geohash = "^0.13.1"
 queue = "^0.3.1"
