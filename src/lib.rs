@@ -95,11 +95,14 @@ where
     let mut accepted_geohashes = HashSet::new();
 
     for polygon in polygons {
-        // Reset per polygon: a cell rejected by one polygon in a multipolygon
-        // must still be tested against the others.
-        let mut rejected_geohashes = HashSet::new();
+        // Per polygon: every part of a multipolygon gets its own full walk. Sharing this
+        // set across parts would let a part whose seed cell was already visited by an
+        // earlier part terminate immediately, silently dropping it from the output.
+        let mut visited_geohashes = HashSet::new();
         let polygon_exterior = polygon.exterior();
         let has_holes = !polygon.interiors().is_empty();
+        // Hoisted: O(vertices), and constant for the whole walk.
+        let polygon_area = polygon.unsigned_area();
 
         // choose a seed inside the polygon
         let Some(seed_point) = seed_interior_point_fast(&polygon) else {
@@ -112,9 +115,7 @@ where
         testing_geohashes.push_back(seed_gh);
 
         while let Some(current_geohash) = testing_geohashes.pop_front() {
-            if accepted_geohashes.contains(&current_geohash)
-                || rejected_geohashes.contains(&current_geohash)
-            {
+            if !visited_geohashes.insert(current_geohash.clone()) {
                 continue;
             }
 
@@ -123,7 +124,6 @@ where
 
             // prune non-intersecting cells early and don't expand from them
             if !polygon.intersects(&current_geohash_polygon) {
-                rejected_geohashes.insert(current_geohash.clone());
                 continue;
             }
 
@@ -134,7 +134,7 @@ where
                 } else {
                     // fast path for hole-free polygons (strict containment)
                     !polygon_exterior.intersects(current_geohash_polygon.exterior())
-                        && current_geohash_polygon.unsigned_area() <= polygon.unsigned_area()
+                        && current_geohash_polygon.unsigned_area() <= polygon_area
                 }
             } else {
                 // intersecting is enough
@@ -143,16 +143,12 @@ where
 
             if accept {
                 accepted_geohashes.insert(current_geohash.clone());
-            } else {
-                rejected_geohashes.insert(current_geohash.clone());
             }
 
             if let Ok(rez) = neighbors(&current_geohash) {
                 for neighbor in [rez.sw, rez.s, rez.se, rez.w, rez.e, rez.nw, rez.n, rez.ne] {
-                    if !accepted_geohashes.contains(&neighbor)
-                        && !rejected_geohashes.contains(&neighbor)
-                    {
-                        testing_geohashes.push_back(neighbor.to_string());
+                    if !visited_geohashes.contains(&neighbor) {
+                        testing_geohashes.push_back(neighbor);
                     }
                 }
             }
@@ -978,6 +974,65 @@ mod tests {
         let results = run_ewkb(vec!["not-a-geohash!"], 4326, None);
         assert_eq!(results.len(), 1);
         assert!(results[0].is_err());
+    }
+
+    // ── polygons_to_geohashes ────────────────────────────────────────────────
+
+    fn rect_polygon(xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> Polygon {
+        Polygon::new(
+            geo_types::LineString::new(vec![
+                geo_types::Coord { x: xmin, y: ymin },
+                geo_types::Coord { x: xmax, y: ymin },
+                geo_types::Coord { x: xmax, y: ymax },
+                geo_types::Coord { x: xmin, y: ymax },
+                geo_types::Coord { x: xmin, y: ymin },
+            ]),
+            vec![],
+        )
+    }
+
+    /// A multipolygon must cover the union of its parts, even when one part's seed
+    /// point falls inside a region already covered by an earlier part.
+    ///
+    /// `b`'s centroid (-73.555) lies inside `a` (-73.60 .. -73.55), so a walk that
+    /// stops at cells an earlier part already accepted terminates on `b`'s seed and
+    /// drops `b` entirely.
+    #[test]
+    fn test_multipolygon_part_with_seed_inside_earlier_part() {
+        let a = rect_polygon(-73.60, 45.50, -73.55, 45.55);
+        let b = rect_polygon(-73.590, 45.520, -73.520, 45.525);
+
+        for fully_contained_only in [false, true] {
+            let only_a = polygons_to_geohashes(vec![a.clone()], 7, fully_contained_only).unwrap();
+            let only_b = polygons_to_geohashes(vec![b.clone()], 7, fully_contained_only).unwrap();
+            let union: HashSet<String> = only_a.union(&only_b).cloned().collect();
+
+            let combined =
+                polygons_to_geohashes(vec![a.clone(), b.clone()], 7, fully_contained_only).unwrap();
+
+            assert_eq!(
+                combined,
+                union,
+                "fully_contained_only={fully_contained_only}: multipolygon dropped {} cells \
+                 that the parts produce individually",
+                union.difference(&combined).count()
+            );
+        }
+    }
+
+    /// Part order must not change the result.
+    #[test]
+    fn test_multipolygon_is_order_independent() {
+        let a = rect_polygon(-73.60, 45.50, -73.55, 45.55);
+        let b = rect_polygon(-73.590, 45.520, -73.520, 45.525);
+
+        for fully_contained_only in [false, true] {
+            let ab =
+                polygons_to_geohashes(vec![a.clone(), b.clone()], 7, fully_contained_only).unwrap();
+            let ba =
+                polygons_to_geohashes(vec![b.clone(), a.clone()], 7, fully_contained_only).unwrap();
+            assert_eq!(ab, ba, "fully_contained_only={fully_contained_only}");
+        }
     }
 }
 
