@@ -404,6 +404,10 @@ Every finding from the review is now implemented. Two things surfaced along the 
 - **An Arrow-returning `polygon_to_geohashes`.** After P5 the cover itself is no
   longer the bottleneck for large polygons — building the returned Python `set` is.
   Same fix as P2, and the last remaining ceiling on that path.
-- `seed_interior_point_fast` is now unused inside the crate, since the descent
-  needs no seed point. It is still `pub`, so removing it is a breaking change
-  for any Rust consumer — left in place pending a call on that.
+- ~~`seed_interior_point_fast`~~ — removed, in the branch that made it obsolete
+  (`perf/hierarchical-descent`). The descent starts from the grid and never needs
+  a point known to be inside the polygon, so the whole centroid → 24 probes →
+  bbox centre → 4x4 grid → `interior_point` ladder had no callers. Deleting it
+  also removed a failure mode rather than just dead code: the old walk silently
+  skipped any polygon the ladder could not find a seed for. Breaking for Rust
+  consumers of the rlib, since it was `pub`.
