@@ -230,7 +230,9 @@ Caveat: uses DE-9IM `contains` for all polygons — see B5.
 
 ---
 
-### [ ] P2 — The Python boundary dominates the bulk encode/decode functions **[H]**
+### [x] P2 — The Python boundary dominates the bulk encode/decode functions **[H]**
+
+> **Done** — `perf/arrow-wkb-output` (PR8) and `perf/arrow-codec-coords` (PR9).
 
 `src/lib.rs:328-525`
 
@@ -246,10 +248,31 @@ Python `bytes` objects on the way out. This also explains why the `num_threads` 
 nothing here: 40.0 ms with the default pool vs 44.3 ms with `num_threads=8` — noise on a
 3 ms core.
 
-**Fix:** extend the Arrow pattern already used by `expand_geohash_mapping_arrow` to
-`decode_many_to_wkb` / `decode_many` / `encode_many`. Expect 5–8× end to end.
+Fixed by adding Arrow twins alongside the list API, which is untouched.
+Measured at N = 500,000, precision 7, medians of 15 runs:
 
-Likely worth more than P1 if the DuckDB / PostGIS ingestion path is the hot one.
+| function | list API | Arrow | speedup |
+|---|---|---|---|
+| `decode_many_to_wkb` | 45.0 ms | 3.1 ms | **14.5×** |
+| `decode_many_to_ewkb` | 51.8 ms | 3.2 ms | **16.2×** |
+| `encode_many` | 24.8 ms | 3.4 ms | 7.3× |
+| `decode_many` | 52.8 ms | 1.9 ms | **27.8×** |
+| `decode_many_exactly` | 68.8 ms | 2.8 ms | **24.6×** |
+
+Even when the data starts as a Python list and must be converted first,
+`list → pa.array → decode_many_to_wkb_arrow` is 10.5 ms, still 4.3×. Output matches the
+list API exactly in every case.
+
+Notes on the implementation:
+
+- Every row of a WKB/EWKB or geohash column is a fixed width, so the values buffer is
+  allocated once for the whole column and filled across threads in place, removing the
+  per-row `Vec`.
+- Inputs accept `Utf8` or `LargeUtf8`, so callers need not match whichever offset width
+  the library happens to prefer.
+- Nulls propagate rather than being rejected or decoded as an empty string.
+- The decoders return a `RecordBatch` — `(lng, lat)` and `(lng, lat, lng_err, lat_err)` —
+  which is the shape a dataframe or DuckDB table wants, and keeps each column contiguous.
 
 ---
 
@@ -308,16 +331,15 @@ main
                  └─ fix/release-gil-polygon    PR5  B4
                      └─ chore/remove-dead-code PR6  B8, B9
                          └─ chore/rustfmt      PR7  formatting only
+                             └─ perf/arrow-wkb-output       PR8  P2 (WKB/EWKB)
+                                 └─ perf/arrow-codec-coords PR9  P2 (encode/decode)
 ```
 
-Verified at the tip of the stack: 41 Rust tests, 137 Python tests,
+Verified at the tip of the stack: 58 Rust tests, 165 Python tests,
 `cargo clippy --all-targets` silent, `cargo fmt --check` clean.
 
 ## Still open
 
-- **P2** — Arrow variants for `decode_many_to_wkb` / `decode_many` /
-  `encode_many`. The largest remaining win (~5–8x on the bulk API) and
-  independent of everything above.
 - **P4** — dictionary-encode the repeated `geog_id` column.
 - **P5** — parallelise the polygon cover across subtrees.
 - `seed_interior_point_fast` is now unused inside the crate, since the descent
