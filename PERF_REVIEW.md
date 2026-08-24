@@ -10,7 +10,9 @@ Legend: **[H]** high / **[M]** medium / **[L]** low.
 
 ## Bugs
 
-### [ ] B1 — MultiPolygon parts silently dropped **[H]**
+### [x] B1 — MultiPolygon parts silently dropped
+
+> **Done** — `fix/multipolygon-dropped-parts` (PR1). **[H]**
 
 `src/lib.rs:115-119`
 
@@ -38,7 +40,9 @@ exhibit this bug structurally.*
 
 ---
 
-### [ ] B2 — `n_hops_for` can produce an unbounded hop count **[M]**
+### [x] B2 — `n_hops_for` can produce an unbounded hop count
+
+> **Done** — `fix/hop-count-guard` (PR4). **[M]**
 
 `src/lib.rs:529-542`
 
@@ -59,7 +63,9 @@ letting the BFS run away.
 
 ---
 
-### [ ] B3 — `expand_geohash_set` does a full pre-pass even when `n_hops == 0` **[M]**
+### [x] B3 — `expand_geohash_set` does a full pre-pass even when `n_hops == 0`
+
+> **Done** — `perf/expand-integer-keys` (PR3). **[M]**
 
 `src/lib.rs:63-69`
 
@@ -79,7 +85,9 @@ validating explicitly.
 
 ---
 
-### [ ] B4 — `polygon_to_geohashes` never releases the GIL **[M]**
+### [x] B4 — `polygon_to_geohashes` never releases the GIL
+
+> **Done** — `fix/release-gil-polygon` (PR5). **[M]**
 
 `src/lib.rs:270-315`
 
@@ -91,7 +99,9 @@ Every other heavy function in the file already uses `py.detach`.
 
 ---
 
-### [ ] B5 — Inconsistent containment semantics between the two `inner=true` paths **[M]**
+### [x] B5 — Inconsistent containment semantics between the two `inner=true` paths
+
+> **Done** — `perf/hierarchical-descent` (PR2). **[M]**
 
 `src/lib.rs:130-138`
 
@@ -107,7 +117,9 @@ polygons — confirm against the test suite before merging.
 
 ---
 
-### [ ] B6 — `neighbor.to_string()` on an already-owned `String` **[L]**
+### [x] B6 — `neighbor.to_string()` on an already-owned `String`
+
+> **Done** — `fix/multipolygon-dropped-parts` (PR1). **[L]**
 
 `src/lib.rs:155` and `src/lib.rs:221`
 
@@ -118,7 +130,9 @@ allocations + copies per visited cell.
 
 ---
 
-### [ ] B7 — `polygon.unsigned_area()` recomputed inside the BFS loop **[L]**
+### [x] B7 — `polygon.unsigned_area()` recomputed inside the BFS loop
+
+> **Done** — `fix/multipolygon-dropped-parts` (PR1). **[L]**
 
 `src/lib.rs:137`
 
@@ -129,7 +143,9 @@ Hoisting it out of the loop alone: verdun p9 `inner=true` 2524 ms → 2343 ms (~
 
 ---
 
-### [ ] B8 — `handbrake`: envelope-rejected cells are neither recorded nor expanded from **[L]**
+### [x] B8 — `handbrake`: envelope-rejected cells are neither recorded nor expanded from
+
+> **Done** — `chore/remove-dead-code` (PR6). **[L]**
 
 `src/lib.rs:199-201`
 
@@ -143,7 +159,9 @@ duplicated work).
 
 ---
 
-### [ ] B9 — Minor papercuts **[L]**
+### [x] B9 — Minor papercuts
+
+> **Done** — `chore/remove-dead-code` (PR6). **[L]**
 
 - A null inside a geohash list in `expand_geohash_mapping_arrow` reads back as `""` and
   surfaces as `"all geohashes in a group must have the same precision"` — confusing error.
@@ -156,7 +174,9 @@ duplicated work).
 
 ## Performance
 
-### [ ] P1 — Replace the flood-fill with hierarchical descent over the geohash tree **[H]**
+### [x] P1 — Replace the flood-fill with hierarchical descent over the geohash tree
+
+> **Done** — `perf/hierarchical-descent` (PR2). **[H]**
 
 `src/lib.rs:87-162`
 
@@ -233,7 +253,9 @@ Likely worth more than P1 if the DuckDB / PostGIS ingestion path is the hot one.
 
 ---
 
-### [ ] P3 — Integer geohash keys in `expand_geohash_set` **[M]**
+### [x] P3 — Integer geohash keys in `expand_geohash_set`
+
+> **Done** — `perf/expand-integer-keys` (PR3). **[M]**
 
 `src/lib.rs:49-83`
 
@@ -271,10 +293,33 @@ rather than sharing.
 
 ---
 
-## Suggested order
+## Branch stack
 
-1. B1 (correctness, ships independently)
-2. P1 + P3 (share the integer-geohash helpers; P1 subsumes B5, B7 and makes B1 structural)
-3. B2, B3, B4
-4. P2 (largest win for the bulk API, independent of everything above)
-5. B6, B8, B9, P4, P5
+Each branch is built on the one above it, so they merge bottom-up. Local only
+— nothing has been pushed.
+
+```
+main
+ ├─ docs/code-review-checklist          this file
+ └─ fix/multipolygon-dropped-parts      PR1  B1, B6, B7
+     └─ perf/hierarchical-descent       PR2  P1, B5      (+ ghbits)
+         └─ perf/expand-integer-keys    PR3  P3, B3
+             └─ fix/hop-count-guard     PR4  B2
+                 └─ fix/release-gil-polygon    PR5  B4
+                     └─ chore/remove-dead-code PR6  B8, B9
+                         └─ chore/rustfmt      PR7  formatting only
+```
+
+Verified at the tip of the stack: 41 Rust tests, 137 Python tests,
+`cargo clippy --all-targets` silent, `cargo fmt --check` clean.
+
+## Still open
+
+- **P2** — Arrow variants for `decode_many_to_wkb` / `decode_many` /
+  `encode_many`. The largest remaining win (~5–8x on the bulk API) and
+  independent of everything above.
+- **P4** — dictionary-encode the repeated `geog_id` column.
+- **P5** — parallelise the polygon cover across subtrees.
+- `seed_interior_point_fast` is now unused inside the crate, since the descent
+  needs no seed point. It is still `pub`, so removing it is a breaking change
+  for any Rust consumer — left in place pending a call on that.
