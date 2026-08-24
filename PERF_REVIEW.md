@@ -296,23 +296,80 @@ The same helpers (`gh_pack` / `gh_unpack` / `gh_bbox` / `gh_neighbors`) serve P1
 
 ---
 
-### [ ] P4 — `expand_geohash_mapping_arrow` repeats `geog_id` once per row **[L]**
+### [x] P4 — `expand_geohash_mapping_arrow` repeats `geog_id` once per row **[L]**
+
+> **Done** — `perf/arrow-geog-id-dictionary` (PR10).
 
 `src/lib.rs:730-750`
 
-For 100k geographies × 500 cells, the `geog_id` column alone is ~1 GB of `LargeUtf8`.
-Dictionary or run-end encoding would cut it roughly 5×. Schema change — only worth it if
-both ends of the pipe are under your control.
+One row per (geog_id, geohash) pair means every row of a group repeats that group's
+id, so the column is almost entirely duplicate bytes.
+
+Added `dictionary_geog_id`, emitting `Dictionary<Int32, Utf8>` instead. On 20,000
+geographies of 300 cells each — 6M rows, with short 11-character ids:
+
+| | plain | dictionary | |
+|---|---|---|---|
+| `geog_id` column | 114.0 MB | 24.3 MB | **4.7×** |
+| whole batch | 204.0 MB | 114.3 MB | 1.8× |
+| call | 362 ms | 294 ms | 1.2× |
+
+Longer ids widen the gap — the dictionary column's size does not depend on id length
+beyond the one stored copy. Defaults to off, so the existing schema is unchanged.
+
+Run-end encoding would compress far harder still (6M rows → 20,000 runs, since the
+rows are already grouped), but support outside pyarrow is patchier, so it is not
+offered.
 
 ---
 
-### [ ] P5 — `polygon_to_geohashes` is single-threaded **[L]**
+### [x] P5 — `polygon_to_geohashes` is single-threaded **[L]**
 
-`rayon` is already a dependency but the polygon path never uses it. With P1 in place the
-32 top-level subtrees (and the parts of a MultiPolygon) fan out cleanly.
+> **Done** — `perf/parallel-polygon-cover` (PR11).
 
-Note: `PreparedGeometry` holds an `Rc` and is therefore `!Send` — build one per worker
-rather than sharing.
+Subtrees at the same level are disjoint, so they can be walked independently with no
+coordination. The starting cells are split mechanically — no geometry — until there
+are enough subtrees to keep every worker busy.
+
+`PreparedGeometry` holds its R*-tree behind an `Rc` and cannot cross threads, so each
+chunk builds its own (~61 µs for a 556-vertex polygon). That is why the fan-out only
+engages above `PARALLEL_COVER_MIN_CELLS`.
+
+Rust-side, criterion against a saved baseline:
+
+| case | change |
+|---|---|
+| verdun p9 `inner=false` | **−68.3%** |
+| verdun p9 `inner=true` | **−68.9%** |
+| whitehorse p7 `inner=false` | −54.3% |
+| whitehorse p7 `inner=true` | −53.7% |
+| verdun p8, whitehorse p6 (below threshold) | −1% to −3% |
+
+End to end from Python the same calls go 174 → 84 ms and 282 → 198 ms. The smaller
+ratios are the remaining ceiling: building the returned Python `set` of several
+hundred thousand strings is serial, and now dominates. **An Arrow-returning variant
+of `polygon_to_geohashes` would lift it**, the same way P2 did for the bulk codec.
+
+Covering one polygon also stopped needing a hash set: disjoint subtrees cannot emit a
+cell twice, so cells accumulate into a `Vec` and only a multipolygon pays for
+deduplication. That is the small gain below the threshold.
+
+---
+
+## Where the measurements live
+
+Two places:
+
+- **Each commit message** carries the before/after table for its own change.
+- **This file** consolidates them per finding.
+
+`benches/bench.rs` covers the paths these numbers come from — the cover at the
+precisions where parallelism engages, expansion including the 0 m case, and the
+`geohashes_to_wkb` core — so the Rust-side figures are reproducible with
+`cargo bench`. Use `--save-baseline`/`--baseline` for an A/B across branches.
+
+The Python-boundary figures (P2, P4) were measured with throwaway scripts rather
+than a committed harness; reproducing those means re-deriving them.
 
 ---
 
@@ -333,15 +390,20 @@ main
                          └─ chore/rustfmt      PR7  formatting only
                              └─ perf/arrow-wkb-output       PR8  P2 (WKB/EWKB)
                                  └─ perf/arrow-codec-coords PR9  P2 (encode/decode)
+                                     └─ perf/arrow-geog-id-dictionary  PR10  P4
+                                         └─ perf/parallel-polygon-cover PR11  P5
 ```
 
-Verified at the tip of the stack: 58 Rust tests, 165 Python tests,
+Verified at the tip of the stack: 60 Rust tests, 171 Python tests,
 `cargo clippy --all-targets` silent, `cargo fmt --check` clean.
 
 ## Still open
 
-- **P4** — dictionary-encode the repeated `geog_id` column.
-- **P5** — parallelise the polygon cover across subtrees.
+Every finding from the review is now implemented. Two things surfaced along the way:
+
+- **An Arrow-returning `polygon_to_geohashes`.** After P5 the cover itself is no
+  longer the bottleneck for large polygons — building the returned Python `set` is.
+  Same fix as P2, and the last remaining ceiling on that path.
 - `seed_interior_point_fast` is now unused inside the crate, since the descent
   needs no seed point. It is still `pub`, so removing it is a breaking change
   for any Rust consumer — left in place pending a call on that.
