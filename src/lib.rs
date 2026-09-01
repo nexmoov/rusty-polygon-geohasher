@@ -1,18 +1,15 @@
-use geo::{
-    algorithm::centroid::Centroid, BoundingRect, Contains, Intersects, Polygon, PreparedGeometry,
-    Rect, Relate,
-};
+use geo::{BoundingRect, Intersects, Polygon, PreparedGeometry, Rect, Relate};
 
 use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StringArray};
 use arrow_array::builder::LargeStringBuilder;
 use arrow_schema::{DataType, Field, Schema};
-use geohash::{decode_bbox, encode, neighbors, GeohashError};
+use geohash::{decode_bbox, encode, GeohashError};
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 use pyo3::wrap_pyfunction;
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 // ── Integer geohash representation ───────────────────────────────────────────
@@ -418,72 +415,6 @@ where
         .into_iter()
         .map(|cell| ghbits::unpack(cell, precision))
         .collect())
-}
-
-pub fn polygons_to_geohashes_handbrake<PI>(
-    polygons: PI,
-    precision: usize,
-    inner: bool,
-) -> Result<HashSet<String>, GeohashError>
-where
-    PI: IntoIterator<Item = Polygon>,
-{
-    let mut inner_geohashes = HashSet::new();
-    let mut outer_geohashes = HashSet::new();
-
-    for polygon in polygons {
-        let envelope = polygon.bounding_rect().unwrap();
-
-        let centroid = polygon.centroid().unwrap();
-        let centroid_geohash = encode((centroid.x(), centroid.y()).into(), precision)?;
-
-        let mut testing_geohashes = VecDeque::new();
-        testing_geohashes.push_back(centroid_geohash);
-
-        while let Some(current_geohash) = testing_geohashes.pop_front() {
-            if inner_geohashes.contains(&current_geohash)
-                || outer_geohashes.contains(&current_geohash)
-            {
-                continue;
-            }
-
-            let rect_bbox = decode_bbox(&current_geohash)?;
-            let current_geohash_polygon = rect_bbox.to_polygon();
-
-            let condition = if inner {
-                envelope.contains(&rect_bbox)
-            } else {
-                envelope.intersects(&rect_bbox)
-            };
-            if !condition {
-                continue;
-            }
-
-            if inner {
-                if polygon.contains(&current_geohash_polygon) {
-                    inner_geohashes.insert(current_geohash.clone());
-                } else {
-                    outer_geohashes.insert(current_geohash.clone());
-                }
-            } else {
-                if polygon.intersects(&current_geohash_polygon) {
-                    inner_geohashes.insert(current_geohash.clone());
-                } else {
-                    outer_geohashes.insert(current_geohash.clone());
-                }
-            }
-
-            if let Ok(rez) = neighbors(&current_geohash) {
-                for neighbor in [rez.sw, rez.s, rez.se, rez.w, rez.e, rez.nw, rez.n, rez.ne] {
-                    if !inner_geohashes.contains(&neighbor) && !outer_geohashes.contains(&neighbor)
-                    {
-                        testing_geohashes.push_back(neighbor.to_string());
-                    }
-                }
-            }
-        }
-    }
-    Ok(inner_geohashes)
 }
 
 /// Walk a `__geo_interface__` coordinate ring (list of [x, y] pairs) into a LineString.
@@ -1000,6 +931,12 @@ fn expand_geohash_mapping_arrow(
             if start == end {
                 return Ok(0);
             }
+            if let Some(j) = (start..end).find(|&j| values_arr.is_null(j)) {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "geohash_lists[{i}] contains a null at position {}",
+                    j - start
+                )));
+            }
             let first = values_arr.value(start);
             let expected_len = first.len();
             if (start + 1..end).any(|j| values_arr.value(j).len() != expected_len) {
@@ -1096,7 +1033,12 @@ fn geohash_polygon(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use geohash::decode_bbox;
+    // Used only by the brute-force oracle, which deliberately avoids the
+    // prepared-geometry path the library itself takes.
+    use geo::Contains;
+    // `neighbors` comes from the `geohash` crate, not from this one. It is the
+    // oracle the `ghbits::neighbors` tests check against.
+    use geohash::{decode_bbox, neighbors};
 
     fn read_f64_le(buf: &[u8], offset: usize) -> f64 {
         f64::from_le_bytes(buf[offset..offset + 8].try_into().unwrap())
