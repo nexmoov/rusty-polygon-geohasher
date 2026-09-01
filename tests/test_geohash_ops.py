@@ -185,6 +185,25 @@ def test_expand_geohashes_large_but_sane_expansion_is_allowed():
     assert len(result) > 1000
 
 
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: geohash_polygon.decode_exactly(""),
+        lambda: geohash_polygon.decode_many([""]),
+        lambda: geohash_polygon.decode_many_exactly([""]),
+        lambda: geohash_polygon.decode_many_to_wkb([""]),
+        lambda: geohash_polygon.decode_many_to_ewkb([""]),
+        lambda: geohash_polygon.expand_geohashes([""], 100.0),
+        lambda: geohash_polygon.expand_geohash_mapping([[""]], 100.0),
+    ],
+)
+def test_empty_geohash_raises(call):
+    """The geohash crate decodes "" to the whole-world bbox, so an empty value
+    from an upstream join would silently become a planet-sized polygon."""
+    with pytest.raises(ValueError):
+        call()
+
+
 def test_expand_geohashes_reach_is_order_independent():
     """The hop count is sized on the narrowest cell in the group, not on
     whichever cell happens to come first, so input order cannot change the
