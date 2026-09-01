@@ -268,11 +268,15 @@ pub fn expand_geohash_set(
 /// Called once a cell is known to lie wholly inside the polygon, at which point
 /// its whole subtree is inside too and needs no further geometry tests.
 #[inline]
-fn emit_subtree(cell: u64, level: usize, precision: usize, out: &mut FxHashSet<u64>) {
+fn emit_subtree(cell: u64, level: usize, precision: usize, out: &mut Vec<u64>) {
     let shift = 5 * (precision - level);
     let base = cell << shift;
-    for k in 0..(1u64 << shift) {
-        out.insert(base | k);
+    let count = 1u64 << shift;
+    // Clamped so an absurd subtree grows the Vec instead of asking the allocator
+    // for a block it will refuse, which aborts rather than unwinds.
+    out.reserve(count.min(1 << 24) as usize);
+    for k in 0..count {
+        out.push(base | k);
     }
 }
 
@@ -349,6 +353,141 @@ fn out_of_range_corner(bbox: &Rect<f64>) -> Option<geo_types::Coord<f64>> {
         .find(|c| !(-180.0..=180.0).contains(&c.x) || !(-90.0..=90.0).contains(&c.y))
 }
 
+/// Descend `work` against `prepared`, appending every accepted cell to `out`.
+///
+/// Cells in `work` must be disjoint, which the geohash tree guarantees for cells
+/// at one level. Their subtrees are then disjoint too, so `out` never receives a
+/// duplicate and needs no set to deduplicate against.
+fn cover_work<'a>(
+    prepared: &PreparedGeometry<'a, &'a Polygon>,
+    polygon_bbox: &Rect<f64>,
+    work: &[(u64, usize)],
+    precision: usize,
+    fully_contained_only: bool,
+    out: &mut Vec<u64>,
+) {
+    let mut stack: Vec<(u64, usize)> = work.to_vec();
+    while let Some((cell, level)) = stack.pop() {
+        let cell_bbox = ghbits::bbox(cell, level);
+
+        // Cheap rejection before paying for a topological test.
+        if !polygon_bbox.intersects(&cell_bbox) {
+            continue;
+        }
+
+        let relation = prepared.relate(&cell_bbox);
+        if !relation.is_intersects() {
+            continue; // whole subtree is outside
+        }
+        if relation.is_contains() {
+            emit_subtree(cell, level, precision, out); // whole subtree is inside
+            continue;
+        }
+        if level == precision {
+            // Straddles the boundary and cannot be subdivided further.
+            if !fully_contained_only {
+                out.push(cell);
+            }
+            continue;
+        }
+
+        let base = cell << 5;
+        for child in 0..32u64 {
+            stack.push((base | child, level + 1));
+        }
+    }
+}
+
+/// Below this many candidate cells, covering a polygon on one thread beats
+/// paying to rebuild a `PreparedGeometry` per worker.
+///
+/// The R*-tree sits behind an `Rc`, so it cannot cross threads and every worker
+/// needs its own — around 61 us for a 556-vertex polygon. That is noise against
+/// a large cover and most of the runtime of a small one.
+const PARALLEL_COVER_MIN_CELLS: u64 = 100_000;
+
+/// Cover one polygon on the calling thread.
+fn polygon_cover_sequential(
+    polygon: &Polygon,
+    polygon_bbox: &Rect<f64>,
+    precision: usize,
+    fully_contained_only: bool,
+) -> Vec<u64> {
+    let (start, _) = descent_start(polygon_bbox, precision);
+    let prepared: PreparedGeometry<_> = PreparedGeometry::from(polygon);
+    let mut out = Vec::new();
+    cover_work(
+        &prepared,
+        polygon_bbox,
+        &start,
+        precision,
+        fully_contained_only,
+        &mut out,
+    );
+    out
+}
+
+/// Cover one polygon across Rayon workers, splitting it into disjoint subtrees.
+fn polygon_cover_parallel(
+    polygon: &Polygon,
+    polygon_bbox: &Rect<f64>,
+    precision: usize,
+    fully_contained_only: bool,
+) -> Vec<u64> {
+    let (start, _) = descent_start(polygon_bbox, precision);
+
+    // Split the starting cells mechanically — no geometry — until there are enough
+    // independent subtrees to keep every worker busy. Cells that land outside the
+    // polygon cost only a bounding-box test once their task runs.
+    let target_tasks = rayon::current_num_threads() * 4;
+    let mut work = start;
+    while !work.is_empty() && work.len() < target_tasks && work[0].1 < precision {
+        work = work
+            .into_iter()
+            .flat_map(|(cell, level)| (0..32u64).map(move |k| ((cell << 5) | k, level + 1)))
+            .collect();
+    }
+
+    // One PreparedGeometry per chunk rather than per task, since building it is the
+    // only per-worker cost worth avoiding.
+    let chunk_size = work.len().div_ceil(target_tasks).max(1);
+    work.par_chunks(chunk_size)
+        .map(|chunk| {
+            let prepared: PreparedGeometry<_> = PreparedGeometry::from(polygon);
+            let mut out = Vec::new();
+            cover_work(
+                &prepared,
+                polygon_bbox,
+                chunk,
+                precision,
+                fully_contained_only,
+                &mut out,
+            );
+            out
+        })
+        .reduce(Vec::new, |mut acc, mut part| {
+            // Append the shorter run onto the longer one.
+            if acc.len() < part.len() {
+                std::mem::swap(&mut acc, &mut part);
+            }
+            acc.append(&mut part);
+            acc
+        })
+}
+
+/// Cells covering one polygon. Disjoint by construction, so the caller only has
+/// to deduplicate between polygons, never within one.
+fn polygon_cover(polygon: &Polygon, precision: usize, fully_contained_only: bool) -> Vec<u64> {
+    let Some(polygon_bbox) = polygon.bounding_rect() else {
+        return Vec::new(); // empty polygon, nothing to cover
+    };
+    if cover_count(&polygon_bbox, precision) < PARALLEL_COVER_MIN_CELLS {
+        polygon_cover_sequential(polygon, &polygon_bbox, precision, fully_contained_only)
+    } else {
+        polygon_cover_parallel(polygon, &polygon_bbox, precision, fully_contained_only)
+    }
+}
+
 /// Cells of `precision` covering `polygons`, either intersecting them or wholly
 /// inside them when `fully_contained_only` is set.
 ///
@@ -373,50 +512,40 @@ where
         return Err(GeohashError::InvalidLength(precision));
     }
 
-    let mut accepted: FxHashSet<u64> = FxHashSet::default();
-
-    for polygon in polygons {
-        let Some(polygon_bbox) = polygon.bounding_rect() else {
-            continue; // empty polygon, nothing to cover
-        };
-        if let Some(corner) = out_of_range_corner(&polygon_bbox) {
-            return Err(GeohashError::InvalidCoordinateRange(corner));
-        }
-        let prepared: PreparedGeometry<_> = PreparedGeometry::from(&polygon);
-
-        let (mut stack, _) = descent_start(&polygon_bbox, precision);
-        while let Some((cell, level)) = stack.pop() {
-            let cell_bbox = ghbits::bbox(cell, level);
-
-            // Cheap rejection before paying for a topological test.
-            if !polygon_bbox.intersects(&cell_bbox) {
-                continue;
-            }
-
-            let relation = prepared.relate(&cell_bbox);
-            if !relation.is_intersects() {
-                continue; // whole subtree is outside
-            }
-            if relation.is_contains() {
-                emit_subtree(cell, level, precision, &mut accepted); // whole subtree is inside
-                continue;
-            }
-            if level == precision {
-                // Straddles the boundary and cannot be subdivided further.
-                if !fully_contained_only {
-                    accepted.insert(cell);
-                }
-                continue;
-            }
-
-            let base = cell << 5;
-            for child in 0..32u64 {
-                stack.push((base | child, level + 1));
+    // Validate every bounding box before covering anything, so a bad polygon
+    // errors instead of clamping — and no work is spent on its predecessors.
+    let polygons: Vec<Polygon> = polygons.into_iter().collect();
+    for polygon in &polygons {
+        if let Some(bbox) = polygon.bounding_rect() {
+            if let Some(corner) = out_of_range_corner(&bbox) {
+                return Err(GeohashError::InvalidCoordinateRange(corner));
             }
         }
     }
 
-    Ok(accepted
+    let mut covers = polygons
+        .into_iter()
+        .map(|polygon| polygon_cover(&polygon, precision, fully_contained_only));
+
+    let Some(first) = covers.next() else {
+        return Ok(HashSet::new());
+    };
+
+    // A single polygon is the common case and its cells are already distinct, so
+    // skip the set entirely. Parts of a multipolygon may overlap, so those need it.
+    let cells: Vec<u64> = match covers.next() {
+        None => first,
+        Some(second) => {
+            let mut seen: FxHashSet<u64> = first.into_iter().collect();
+            seen.extend(second);
+            for cover in covers {
+                seen.extend(cover);
+            }
+            seen.into_iter().collect()
+        }
+    };
+
+    Ok(cells
         .into_iter()
         .map(|cell| ghbits::unpack(cell, precision))
         .collect())
@@ -2176,6 +2305,78 @@ mod tests {
             got, want,
             "the cell and its eight touching neighbours should all be covered"
         );
+    }
+
+    /// The parallel split must produce exactly the cells the sequential walk does.
+    ///
+    /// The oracle tests above run below PARALLEL_COVER_MIN_CELLS and so only
+    /// exercise the sequential path; this drives both explicitly, at a precision
+    /// where the parallel path splits into real work.
+    #[test]
+    fn test_parallel_cover_matches_sequential() {
+        let fixtures = [
+            (
+                "verdun",
+                include_str!("../tests/data/verdun_wkt.txt"),
+                8usize,
+            ),
+            (
+                "whitehorse",
+                include_str!("../tests/data/whitehorse_wkt.txt"),
+                7,
+            ),
+        ];
+        for (name, wkt_str, precision) in fixtures {
+            for polygon in load_fixture(wkt_str) {
+                let bbox = polygon.bounding_rect().unwrap();
+                for fully_contained_only in [false, true] {
+                    let sequential =
+                        polygon_cover_sequential(&polygon, &bbox, precision, fully_contained_only);
+                    let parallel =
+                        polygon_cover_parallel(&polygon, &bbox, precision, fully_contained_only);
+
+                    // Disjoint subtrees: neither path may emit a cell twice.
+                    let sequential_set: FxHashSet<u64> = sequential.iter().copied().collect();
+                    let parallel_set: FxHashSet<u64> = parallel.iter().copied().collect();
+                    assert_eq!(
+                        sequential_set.len(),
+                        sequential.len(),
+                        "{name} p{precision}: sequential cover has duplicates"
+                    );
+                    assert_eq!(
+                        parallel_set.len(),
+                        parallel.len(),
+                        "{name} p{precision}: parallel cover has duplicates"
+                    );
+                    assert_eq!(
+                        sequential_set, parallel_set,
+                        "{name} p{precision} fully_contained_only={fully_contained_only}"
+                    );
+                    assert!(!sequential.is_empty());
+                }
+            }
+        }
+    }
+
+    /// Splitting the work list must not depend on how many threads Rayon has.
+    #[test]
+    fn test_parallel_cover_is_thread_count_independent() {
+        let polygon = rect_polygon(-73.60, 45.50, -73.40, 45.70);
+        let bbox = polygon.bounding_rect().unwrap();
+        let reference = polygon_cover_sequential(&polygon, &bbox, 8, false);
+        let reference: FxHashSet<u64> = reference.into_iter().collect();
+
+        for threads in [1usize, 2, 3, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let got: FxHashSet<u64> = pool
+                .install(|| polygon_cover_parallel(&polygon, &bbox, 8, false))
+                .into_iter()
+                .collect();
+            assert_eq!(got, reference, "{threads} threads");
+        }
     }
 
     /// The cover must refine consistently: every p6 cell's parent is a p5 cell.
