@@ -85,6 +85,25 @@ mod ghbits {
         }
     }
 
+    /// Parse a base32 geohash into its packed form.
+    ///
+    /// `None` if any character is outside the geohash alphabet (which omits
+    /// 'a', 'i', 'l' and 'o'), or if the hash is empty or longer than
+    /// [`MAX_PRECISION`]. Past that length the five-bit shifts below would run
+    /// off the top of the `u64` and silently alias distinct hashes onto the
+    /// same packed value.
+    pub fn pack(hash: &str) -> Option<u64> {
+        if !(1..=MAX_PRECISION).contains(&hash.len()) {
+            return None;
+        }
+        let mut v = 0u64;
+        for c in hash.bytes() {
+            let idx = BASE32.iter().position(|&b| b == c)?;
+            v = (v << 5) | idx as u64;
+        }
+        Some(v)
+    }
+
     /// Render a packed hash back to base32.
     pub fn unpack(v: u64, precision: usize) -> String {
         let mut buf = vec![0u8; precision];
@@ -105,6 +124,37 @@ mod ghbits {
         let xmin = -180.0 + lon_i as f64 * lon_span;
         let ymin = -90.0 + lat_i as f64 * lat_span;
         Rect::new((xmin, ymin), (xmin + lon_span, ymin + lat_span))
+    }
+
+    /// Write the neighbours of `v` into `out`, returning how many were written.
+    ///
+    /// Longitude wraps at the antimeridian. Latitude does *not*: there is no cell
+    /// north of the top row, so polar cells have five neighbours rather than
+    /// eight. `geohash::neighbors` disagrees here and wraps over the pole to the
+    /// opposite edge of the grid, which would teleport a polar expansion into the
+    /// other hemisphere.
+    #[inline]
+    pub fn neighbors(v: u64, precision: usize, out: &mut [u64; 8]) -> usize {
+        let (lon_bits, lat_bits) = axis_bits(precision);
+        let (lon_i, lat_i) = split(v, precision);
+        let lon_mask = (1u64 << lon_bits) - 1;
+        let lat_max = (1u64 << lat_bits) - 1;
+        let mut n = 0;
+        for dy in [-1i64, 0, 1] {
+            for dx in [-1i64, 0, 1] {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let ny = lat_i as i64 + dy;
+                if ny < 0 || ny as u64 > lat_max {
+                    continue;
+                }
+                let nx = (lon_i.wrapping_add(dx as u64)) & lon_mask;
+                out[n] = merge(nx, ny as u64, precision);
+                n += 1;
+            }
+        }
+        n
     }
 }
 
@@ -140,40 +190,73 @@ where
     }
 }
 
-fn all_neighbors(hash: &str) -> Result<[String; 8], GeohashError> {
-    let nbrs = neighbors(hash)?;
-    Ok([nbrs.n, nbrs.ne, nbrs.e, nbrs.se, nbrs.s, nbrs.sw, nbrs.w, nbrs.nw])
+/// Locate the character that stopped [`ghbits::pack`], for the error path.
+fn invalid_hash_error(hash: &str) -> GeohashError {
+    let bad = hash
+        .chars()
+        .find(|c| !c.is_ascii() || !ghbits::BASE32.contains(&(*c as u8)))
+        .unwrap_or('?');
+    GeohashError::InvalidHashCharacter(bad)
 }
 
-/// BFS frontier expansion: expand a set of geohashes outward by `n_hops` steps.
-/// Returns an error if any hash in the input set is malformed.
+/// Expand a set of geohashes outward by `n_hops` rings of neighbouring cells.
+///
+/// Every hash must share one precision, since the cells are walked on that
+/// precision's grid. Returns an error if any hash is malformed or the set mixes
+/// precisions.
 pub fn expand_geohash_set(
     geohashes: &HashSet<String>,
     n_hops: usize,
 ) -> Result<HashSet<String>, GeohashError> {
-    let mut all = geohashes.clone();
-    // Initial frontier: input cells with at least one neighbor outside the set.
-    // Neighbour lookup here validates user-provided hashes.
-    let mut frontier: HashSet<String> = HashSet::new();
-    for gh in all.iter() {
-        let nbrs = all_neighbors(gh)?;
-        if nbrs.iter().any(|n| !all.contains(n)) {
-            frontier.insert(gh.clone());
-        }
+    let Some(first) = geohashes.iter().next() else {
+        return Ok(HashSet::new());
+    };
+    let precision = first.len();
+    if !(1..=ghbits::MAX_PRECISION).contains(&precision) {
+        return Err(GeohashError::InvalidLength(precision));
     }
+
+    // Packing validates every input hash, so this runs even for a zero-hop
+    // expansion where the answer is just the input back.
+    let mut all: FxHashSet<u64> =
+        FxHashSet::with_capacity_and_hasher(geohashes.len(), Default::default());
+    for hash in geohashes {
+        if hash.len() != precision {
+            return Err(GeohashError::InvalidLength(hash.len()));
+        }
+        all.insert(ghbits::pack(hash).ok_or_else(|| invalid_hash_error(hash))?);
+    }
+
+    if n_hops == 0 {
+        return Ok(geohashes.clone());
+    }
+
+    // Ring by ring. Cells already in `all` are never revisited, so interior cells
+    // drop out of the frontier after the first pass without a separate boundary
+    // scan.
+    let mut frontier: Vec<u64> = all.iter().copied().collect();
+    let mut next: Vec<u64> = Vec::new();
+    let mut buf = [0u64; 8];
     for _ in 0..n_hops {
-        let mut new_frontier: HashSet<String> = HashSet::new();
-        for gh in &frontier {
-            for n in all_neighbors(gh)? {
-                if !all.contains(&n) {
-                    new_frontier.insert(n);
+        next.clear();
+        for &cell in &frontier {
+            let count = ghbits::neighbors(cell, precision, &mut buf);
+            for &neighbor in &buf[..count] {
+                if all.insert(neighbor) {
+                    next.push(neighbor);
                 }
             }
         }
-        all.extend(new_frontier.iter().cloned());
-        frontier = new_frontier;
+        if next.is_empty() {
+            break; // the grid is saturated; further hops cannot add anything
+        }
+        std::mem::swap(&mut frontier, &mut next);
     }
-    Ok(all)
+
+    // The final count is already known, so the output set never rehashes.
+    let mut out = HashSet::with_capacity(all.len());
+    out.extend(all.into_iter().map(|cell| ghbits::unpack(cell, precision)));
+    Ok(out)
 }
 
 // ── Polygon → geohash ────────────────────────────────────────────────────────
@@ -1220,6 +1303,102 @@ mod tests {
     }
 
     #[test]
+    fn test_ghbits_pack_unpack_roundtrip() {
+        for hash in [
+            "d",
+            "dr",
+            "dr5",
+            "dr5r",
+            "dr5ru",
+            "dr5ru7",
+            "9q8yy9ve",
+            "u4pruydqqvj",
+            "zzzzzzzzzzzz",
+            "000000000000",
+        ] {
+            let packed = ghbits::pack(hash).expect("valid geohash");
+            assert_eq!(&ghbits::unpack(packed, hash.len()), hash);
+        }
+    }
+
+    #[test]
+    fn test_ghbits_pack_rejects_invalid_characters() {
+        // 'a', 'i', 'l' and 'o' are excluded from the geohash alphabet.
+        for bad in ["a", "dr5i", "dr5l", "dr5o", "dr5!", "dr5é"] {
+            assert!(ghbits::pack(bad).is_none(), "{bad} should not pack");
+        }
+    }
+
+    #[test]
+    fn test_ghbits_pack_rejects_out_of_range_lengths() {
+        assert!(ghbits::pack("").is_none(), "empty hash should not pack");
+        // 13 characters need 65 bits, one more than the packed form holds.
+        let too_long = "z".repeat(ghbits::MAX_PRECISION + 1);
+        assert!(
+            ghbits::pack(&too_long).is_none(),
+            "{too_long} exceeds MAX_PRECISION and should not pack"
+        );
+    }
+
+    #[test]
+    fn test_ghbits_neighbors_match_geohash_crate() {
+        // Away from the polar rows, ghbits and the geohash crate must agree.
+        for hash in ["dr5ru7", "9q8yy9ve", "ezs42", "sp", "d", "u4pruydqqvj"] {
+            let precision = hash.len();
+            let r = neighbors(hash).unwrap();
+            let want: HashSet<String> = [r.n, r.ne, r.e, r.se, r.s, r.sw, r.w, r.nw]
+                .into_iter()
+                .collect();
+
+            let mut buf = [0u64; 8];
+            let count = ghbits::neighbors(ghbits::pack(hash).unwrap(), precision, &mut buf);
+            let got: HashSet<String> = buf[..count]
+                .iter()
+                .map(|&v| ghbits::unpack(v, precision))
+                .collect();
+
+            assert_eq!(want, got, "neighbours of {hash}");
+        }
+    }
+
+    #[test]
+    fn test_ghbits_neighbors_wrap_at_antimeridian() {
+        // "b" is the north-west corner cell and "z" the north-east one; longitude
+        // wraps, so they are neighbours across the antimeridian.
+        let mut buf = [0u64; 8];
+        let count = ghbits::neighbors(ghbits::pack("b").unwrap(), 1, &mut buf);
+        let got: HashSet<String> = buf[..count]
+            .iter()
+            .map(|&v| ghbits::unpack(v, 1))
+            .collect();
+        assert!(got.contains("z"), "expected 'z' among {got:?}");
+    }
+
+    /// Latitude clamps rather than wrapping: there is no cell north of the top
+    /// row. `geohash::neighbors` reports eight neighbours for "zzzzzzzzzzzz",
+    /// three of which have wrapped over the pole to the far edge of the grid.
+    #[test]
+    fn test_ghbits_neighbors_clamp_at_poles() {
+        for hash in ["zzzzzzzzzzzz", "000000000000", "bpbpbpbp"] {
+            let precision = hash.len();
+            let packed = ghbits::pack(hash).unwrap();
+            let mut buf = [0u64; 8];
+            let count = ghbits::neighbors(packed, precision, &mut buf);
+            assert_eq!(count, 5, "{hash} sits in a polar row and has 5 neighbours");
+
+            let (_, lat_i) = ghbits::split(packed, precision);
+            for &neighbor in &buf[..count] {
+                let (_, neighbor_lat) = ghbits::split(neighbor, precision);
+                assert!(
+                    neighbor_lat.abs_diff(lat_i) <= 1,
+                    "{hash}: neighbour {} wrapped over the pole",
+                    ghbits::unpack(neighbor, precision)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_ghbits_axis_bits_total_five_per_character() {
         for precision in 1..=ghbits::MAX_PRECISION {
             let (lon_bits, lat_bits) = ghbits::axis_bits(precision);
@@ -1471,6 +1650,105 @@ mod tests {
             assert!(
                 coarse.contains(&hash[..5]),
                 "p6 cell {hash} has no p5 parent in the coarse cover"
+            );
+        }
+    }
+
+    // ── expand_geohash_set ───────────────────────────────────────────────────
+
+    fn hash_set(hashes: &[&str]) -> HashSet<String> {
+        hashes.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Reference expansion built on the geohash crate, one ring at a time.
+    fn reference_expand(input: &HashSet<String>, n_hops: usize) -> HashSet<String> {
+        let mut all = input.clone();
+        let mut frontier: Vec<String> = all.iter().cloned().collect();
+        for _ in 0..n_hops {
+            let mut next = Vec::new();
+            for hash in &frontier {
+                let r = neighbors(hash).unwrap();
+                for n in [r.n, r.ne, r.e, r.se, r.s, r.sw, r.w, r.nw] {
+                    if all.insert(n.clone()) {
+                        next.push(n);
+                    }
+                }
+            }
+            frontier = next;
+        }
+        all
+    }
+
+    #[test]
+    fn test_expand_matches_reference() {
+        let input = hash_set(&["f2h30", "f2h31", "f2h32", "f2h33"]);
+        for n_hops in [0usize, 1, 2, 5] {
+            assert_eq!(
+                expand_geohash_set(&input, n_hops).unwrap(),
+                reference_expand(&input, n_hops),
+                "n_hops={n_hops}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_expand_zero_hops_returns_input() {
+        let input = hash_set(&["f2h30", "dr5ru"]);
+        assert_eq!(expand_geohash_set(&input, 0).unwrap(), input);
+    }
+
+    #[test]
+    fn test_expand_empty_set() {
+        assert!(expand_geohash_set(&HashSet::new(), 3).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_expand_grows_monotonically() {
+        let input = hash_set(&["f2h30"]);
+        let mut previous = expand_geohash_set(&input, 0).unwrap();
+        for n_hops in 1..=4 {
+            let current = expand_geohash_set(&input, n_hops).unwrap();
+            assert!(
+                previous.is_subset(&current),
+                "hop {n_hops} lost cells from hop {}",
+                n_hops - 1
+            );
+            assert!(current.len() > previous.len(), "hop {n_hops} added nothing");
+            previous = current;
+        }
+    }
+
+    /// A single cell expanded by one hop is its 3x3 block.
+    #[test]
+    fn test_expand_one_hop_is_the_surrounding_block() {
+        let expanded = expand_geohash_set(&hash_set(&["f2h30"]), 1).unwrap();
+        assert_eq!(expanded.len(), 9);
+        assert!(expanded.contains("f2h30"));
+    }
+
+    #[test]
+    fn test_expand_rejects_malformed_input() {
+        // Character outside the geohash alphabet.
+        assert!(expand_geohash_set(&hash_set(&["f2h3i"]), 1).is_err());
+        // Validation happens even when no expansion is requested.
+        assert!(expand_geohash_set(&hash_set(&["f2h3i"]), 0).is_err());
+        // Mixed precisions cannot share one grid.
+        assert!(expand_geohash_set(&hash_set(&["f2h30", "f2h3"]), 1).is_err());
+        // Longer than the geohash crate accepts.
+        assert!(expand_geohash_set(&hash_set(&["f2h30f2h30f2h"]), 1).is_err());
+    }
+
+    /// Expanding from a polar cell must stay in its own hemisphere.
+    #[test]
+    fn test_expand_at_the_pole_does_not_cross_over() {
+        let expanded = expand_geohash_set(&hash_set(&["zzzz"]), 1).unwrap();
+        assert_eq!(expanded.len(), 6, "one polar cell plus five neighbours");
+        for hash in &expanded {
+            let (_, lat_i) = ghbits::split(ghbits::pack(hash).unwrap(), 4);
+            let (_, lat_bits) = ghbits::axis_bits(4);
+            assert!(
+                lat_i >= (1u64 << lat_bits) - 2,
+                "{hash} jumped away from the north pole"
             );
         }
     }
