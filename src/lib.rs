@@ -1,6 +1,6 @@
 use geo::{
-    algorithm::centroid::Centroid, Area, BoundingRect, Contains, InteriorPoint, Intersects, Point,
-    Polygon, Rect,
+    algorithm::centroid::Centroid, BoundingRect, Contains, Intersects, Polygon, PreparedGeometry,
+    Rect, Relate,
 };
 
 use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StringArray};
@@ -11,8 +11,102 @@ use pyo3::prelude::*;
 use pyo3::types::PyAny;
 use pyo3::wrap_pyfunction;
 use rayon::prelude::*;
+use rustc_hash::FxHashSet;
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
+
+// ── Integer geohash representation ───────────────────────────────────────────
+
+/// A geohash of precision `p` is `5 * p` interleaved bits, so every hash of
+/// precision 1..=12 (the range the `geohash` crate accepts) fits in a `u64`.
+///
+/// Working on the packed integer instead of the `String` removes the eight heap
+/// allocations per cell that `geohash::neighbors` costs, lets cells live in a
+/// `FxHashSet<u64>`, and makes a cell's bounding box a couple of shifts and
+/// multiplies rather than a base32 decode.
+///
+/// Bit layout matches the geohash spec: the most significant bit is longitude,
+/// and longitude/latitude alternate from there. With `n = 5 * p` bits total,
+/// longitude therefore occupies `ceil(n / 2)` bits and latitude `floor(n / 2)`.
+mod ghbits {
+    use geo::Rect;
+
+    pub const BASE32: &[u8; 32] = b"0123456789bcdefghjkmnpqrstuvwxyz";
+    pub const MAX_PRECISION: usize = 12;
+
+    /// Gather the even-indexed bits of `x` into the low half of the result.
+    #[inline]
+    fn compact_even(mut x: u64) -> u64 {
+        x &= 0x5555_5555_5555_5555;
+        x = (x | (x >> 1)) & 0x3333_3333_3333_3333;
+        x = (x | (x >> 2)) & 0x0f0f_0f0f_0f0f_0f0f;
+        x = (x | (x >> 4)) & 0x00ff_00ff_00ff_00ff;
+        x = (x | (x >> 8)) & 0x0000_ffff_0000_ffff;
+        (x | (x >> 16)) & 0x0000_0000_ffff_ffff
+    }
+
+    /// Inverse of [`compact_even`]: scatter the low 32 bits of `x` to even positions.
+    #[inline]
+    fn spread_even(mut x: u64) -> u64 {
+        x &= 0x0000_0000_ffff_ffff;
+        x = (x | (x << 16)) & 0x0000_ffff_0000_ffff;
+        x = (x | (x << 8)) & 0x00ff_00ff_00ff_00ff;
+        x = (x | (x << 4)) & 0x0f0f_0f0f_0f0f_0f0f;
+        x = (x | (x << 2)) & 0x3333_3333_3333_3333;
+        (x | (x << 1)) & 0x5555_5555_5555_5555
+    }
+
+    /// Number of longitude and latitude bits at `precision`.
+    #[inline]
+    pub fn axis_bits(precision: usize) -> (u32, u32) {
+        let n = 5 * precision;
+        (n.div_ceil(2) as u32, (n / 2) as u32)
+    }
+
+    /// Split a packed hash into its (longitude, latitude) grid indices.
+    #[inline]
+    pub fn split(v: u64, precision: usize) -> (u64, u64) {
+        // Bit `j` counted from the LSB is a longitude bit iff `n - 1 - j` is even,
+        // i.e. iff `j` has the same parity as `n - 1`.
+        if (5 * precision) % 2 == 1 {
+            (compact_even(v), compact_even(v >> 1))
+        } else {
+            (compact_even(v >> 1), compact_even(v))
+        }
+    }
+
+    /// Interleave (longitude, latitude) grid indices back into a packed hash.
+    #[inline]
+    pub fn merge(lon: u64, lat: u64, precision: usize) -> u64 {
+        if (5 * precision) % 2 == 1 {
+            spread_even(lon) | (spread_even(lat) << 1)
+        } else {
+            (spread_even(lon) << 1) | spread_even(lat)
+        }
+    }
+
+    /// Render a packed hash back to base32.
+    pub fn unpack(v: u64, precision: usize) -> String {
+        let mut buf = vec![0u8; precision];
+        for (i, slot) in buf.iter_mut().enumerate().rev() {
+            *slot = BASE32[((v >> (5 * (precision - 1 - i))) & 31) as usize];
+        }
+        // Every byte came from BASE32, which is ASCII.
+        String::from_utf8(buf).expect("base32 alphabet is ASCII")
+    }
+
+    /// Bounding box of a packed hash, straight from its grid indices.
+    #[inline]
+    pub fn bbox(v: u64, precision: usize) -> Rect<f64> {
+        let (lon_bits, lat_bits) = axis_bits(precision);
+        let (lon_i, lat_i) = split(v, precision);
+        let lon_span = 360.0 / (1u64 << lon_bits) as f64;
+        let lat_span = 180.0 / (1u64 << lat_bits) as f64;
+        let xmin = -180.0 + lon_i as f64 * lon_span;
+        let ymin = -90.0 + lat_i as f64 * lat_span;
+        Rect::new((xmin, ymin), (xmin + lon_span, ymin + lat_span))
+    }
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -82,8 +176,106 @@ pub fn expand_geohash_set(
     Ok(all)
 }
 
-// ── Polygon → geohash (existing) ─────────────────────────────────────────────
+// ── Polygon → geohash ────────────────────────────────────────────────────────
 
+/// Insert `cell` and every one of its descendants at `precision`.
+///
+/// Called once a cell is known to lie wholly inside the polygon, at which point
+/// its whole subtree is inside too and needs no further geometry tests.
+#[inline]
+fn emit_subtree(cell: u64, level: usize, precision: usize, out: &mut FxHashSet<u64>) {
+    let shift = 5 * (precision - level);
+    let base = cell << shift;
+    for k in 0..(1u64 << shift) {
+        out.insert(base | k);
+    }
+}
+
+/// Number of cells at `level` needed to cover `bbox`.
+fn cover_count(bbox: &Rect<f64>, level: usize) -> u64 {
+    let (i0, i1, j0, j1) = cover_range(bbox, level);
+    (i1 - i0 + 1) * (j1 - j0 + 1)
+}
+
+/// Inclusive grid-index range `(lon_min, lon_max, lat_min, lat_max)` covering `bbox`.
+fn cover_range(bbox: &Rect<f64>, level: usize) -> (u64, u64, u64, u64) {
+    let (lon_bits, lat_bits) = ghbits::axis_bits(level);
+    let lon_span = 360.0 / (1u64 << lon_bits) as f64;
+    let lat_span = 180.0 / (1u64 << lat_bits) as f64;
+    let lon_max = (1u64 << lon_bits) - 1;
+    let lat_max = (1u64 << lat_bits) - 1;
+    let clamp = |raw: f64, max: u64| -> u64 {
+        if raw < 0.0 {
+            0
+        } else {
+            (raw as u64).min(max)
+        }
+    };
+    // The upper index uses `floor`, so a maximum sitting exactly on a grid line
+    // still names the cell east/north of it — the one the box touches along that
+    // line. `ceil(v / span) - 1` is the mirror of that for the lower index: it
+    // agrees with `floor` off the grid lines and steps one cell west/south on
+    // them, so a box flush against a grid line seeds the touching cell on both
+    // sides. `relate` still decides whether each seeded cell is kept, so the
+    // only cost of an extra seed is one topological test.
+    let lo = |v: f64, span: f64, max: u64| -> u64 { clamp((v / span).ceil() - 1.0, max) };
+    let hi = |v: f64, span: f64, max: u64| -> u64 { clamp((v / span).floor(), max) };
+    (
+        lo(bbox.min().x + 180.0, lon_span, lon_max),
+        hi(bbox.max().x + 180.0, lon_span, lon_max),
+        lo(bbox.min().y + 90.0, lat_span, lat_max),
+        hi(bbox.max().y + 90.0, lat_span, lat_max),
+    )
+}
+
+/// Seed the descent at the deepest level whose cover is still small.
+///
+/// Starting at precision 1 would spend a `relate` call per cell on levels where
+/// the cell dwarfs the polygon — and at those sizes the R*-tree cannot prune, so
+/// each call walks every edge. Skipping straight to a level whose cells are
+/// comparable to the polygon avoids that entirely.
+fn descent_start(bbox: &Rect<f64>, precision: usize) -> (Vec<(u64, usize)>, usize) {
+    const MAX_START_CELLS: u64 = 64;
+
+    // Level 1 has only 32 cells in total, so it always satisfies the bound.
+    let mut level = 1;
+    while level < precision && cover_count(bbox, level + 1) <= MAX_START_CELLS {
+        level += 1;
+    }
+
+    let (i0, i1, j0, j1) = cover_range(bbox, level);
+    let mut cells = Vec::with_capacity(((i1 - i0 + 1) * (j1 - j0 + 1)) as usize);
+    for i in i0..=i1 {
+        for j in j0..=j1 {
+            cells.push((ghbits::merge(i, j, level), level));
+        }
+    }
+    (cells, level)
+}
+
+/// The corner of `bbox` that lies outside the geohash domain, if any.
+///
+/// `cover_range` clamps every index onto the grid, so geometry beyond
+/// [-180, 180] x [-90, 90] would otherwise come back as a silently empty or
+/// truncated cover instead of an error.
+fn out_of_range_corner(bbox: &Rect<f64>) -> Option<geo_types::Coord<f64>> {
+    [bbox.min(), bbox.max()]
+        .into_iter()
+        .find(|c| !(-180.0..=180.0).contains(&c.x) || !(-90.0..=90.0).contains(&c.y))
+}
+
+/// Cells of `precision` covering `polygons`, either intersecting them or wholly
+/// inside them when `fully_contained_only` is set.
+///
+/// Walks the geohash tree top-down rather than flood-filling at `precision`: a
+/// cell disjoint from the polygon prunes its entire subtree, and a cell the
+/// polygon contains yields all its descendants without further geometry tests.
+/// Only cells straddling the boundary are subdivided, so cost tracks the
+/// polygon's perimeter instead of its area.
+///
+/// A single [`PreparedGeometry::relate`] per visited cell answers "intersects"
+/// and "contains" together, and its R*-tree keeps each call proportional to the
+/// edges near that cell rather than the polygon's full vertex count.
 pub fn polygons_to_geohashes<PI>(
     polygons: PI,
     precision: usize,
@@ -92,69 +284,57 @@ pub fn polygons_to_geohashes<PI>(
 where
     PI: IntoIterator<Item = Polygon>,
 {
-    let mut accepted_geohashes = HashSet::new();
+    if !(1..=ghbits::MAX_PRECISION).contains(&precision) {
+        return Err(GeohashError::InvalidLength(precision));
+    }
+
+    let mut accepted: FxHashSet<u64> = FxHashSet::default();
 
     for polygon in polygons {
-        // Per polygon: every part of a multipolygon gets its own full walk. Sharing this
-        // set across parts would let a part whose seed cell was already visited by an
-        // earlier part terminate immediately, silently dropping it from the output.
-        let mut visited_geohashes = HashSet::new();
-        let polygon_exterior = polygon.exterior();
-        let has_holes = !polygon.interiors().is_empty();
-        // Hoisted: O(vertices), and constant for the whole walk.
-        let polygon_area = polygon.unsigned_area();
-
-        // choose a seed inside the polygon
-        let Some(seed_point) = seed_interior_point_fast(&polygon) else {
-            continue; // degenerate polygon, skip
+        let Some(polygon_bbox) = polygon.bounding_rect() else {
+            continue; // empty polygon, nothing to cover
         };
+        if let Some(corner) = out_of_range_corner(&polygon_bbox) {
+            return Err(GeohashError::InvalidCoordinateRange(corner));
+        }
+        let prepared: PreparedGeometry<_> = PreparedGeometry::from(&polygon);
 
-        // convert to geohash and start BFS
-        let mut testing_geohashes = VecDeque::new();
-        let seed_gh = encode((seed_point.x(), seed_point.y()).into(), precision)?;
-        testing_geohashes.push_back(seed_gh);
+        let (mut stack, _) = descent_start(&polygon_bbox, precision);
+        while let Some((cell, level)) = stack.pop() {
+            let cell_bbox = ghbits::bbox(cell, level);
 
-        while let Some(current_geohash) = testing_geohashes.pop_front() {
-            if !visited_geohashes.insert(current_geohash.clone()) {
+            // Cheap rejection before paying for a topological test.
+            if !polygon_bbox.intersects(&cell_bbox) {
                 continue;
             }
 
-            let gh_bbox = decode_bbox(&current_geohash)?;
-            let current_geohash_polygon = gh_bbox.to_polygon();
-
-            // prune non-intersecting cells early and don't expand from them
-            if !polygon.intersects(&current_geohash_polygon) {
+            let relation = prepared.relate(&cell_bbox);
+            if !relation.is_intersects() {
+                continue; // whole subtree is outside
+            }
+            if relation.is_contains() {
+                emit_subtree(cell, level, precision, &mut accepted); // whole subtree is inside
+                continue;
+            }
+            if level == precision {
+                // Straddles the boundary and cannot be subdivided further.
+                if !fully_contained_only {
+                    accepted.insert(cell);
+                }
                 continue;
             }
 
-            let accept = if fully_contained_only {
-                if has_holes {
-                    // robust path when holes exist
-                    polygon.contains(&current_geohash_polygon)
-                } else {
-                    // fast path for hole-free polygons (strict containment)
-                    !polygon_exterior.intersects(current_geohash_polygon.exterior())
-                        && current_geohash_polygon.unsigned_area() <= polygon_area
-                }
-            } else {
-                // intersecting is enough
-                true
-            };
-
-            if accept {
-                accepted_geohashes.insert(current_geohash.clone());
-            }
-
-            if let Ok(rez) = neighbors(&current_geohash) {
-                for neighbor in [rez.sw, rez.s, rez.se, rez.w, rez.e, rez.nw, rez.n, rez.ne] {
-                    if !visited_geohashes.contains(&neighbor) {
-                        testing_geohashes.push_back(neighbor);
-                    }
-                }
+            let base = cell << 5;
+            for child in 0..32u64 {
+                stack.push((base | child, level + 1));
             }
         }
     }
-    Ok(accepted_geohashes)
+
+    Ok(accepted
+        .into_iter()
+        .map(|cell| ghbits::unpack(cell, precision))
+        .collect())
 }
 
 pub fn polygons_to_geohashes_handbrake<PI>(
@@ -976,6 +1156,79 @@ mod tests {
         assert!(results[0].is_err());
     }
 
+    // ── ghbits (integer geohash representation) ──────────────────────────────
+
+    /// Grid positions spanning every precision, both bit parities, and the grid
+    /// corners where the interleaving is easiest to get wrong.
+    fn ghbits_grid_samples() -> Vec<(u64, u64, usize)> {
+        let mut out = Vec::new();
+        for precision in 1..=ghbits::MAX_PRECISION {
+            let (lon_bits, lat_bits) = ghbits::axis_bits(precision);
+            let lon_max = (1u64 << lon_bits) - 1;
+            let lat_max = (1u64 << lat_bits) - 1;
+            for (i, j) in [
+                (0, 0),
+                (lon_max, lat_max),
+                (0, lat_max),
+                (lon_max, 0),
+                (lon_max / 3, lat_max / 2),
+                (1, lat_max - 1),
+            ] {
+                out.push((i, j, precision));
+            }
+        }
+        out
+    }
+
+    /// ghbits must agree with the `geohash` crate it stands in for, in both
+    /// directions: a cell's centre encodes to the cell's own hash, and that hash
+    /// decodes to the cell's own bounding box.
+    #[test]
+    fn test_ghbits_matches_geohash_crate() {
+        for (i, j, precision) in ghbits_grid_samples() {
+            let packed = ghbits::merge(i, j, precision);
+            assert_eq!(
+                ghbits::split(packed, precision),
+                (i, j),
+                "split(merge(..)) must round-trip at p{precision}"
+            );
+
+            let bbox = ghbits::bbox(packed, precision);
+            let hash = ghbits::unpack(packed, precision);
+            assert_eq!(hash.len(), precision);
+
+            let centre = (
+                (bbox.min().x + bbox.max().x) / 2.0,
+                (bbox.min().y + bbox.max().y) / 2.0,
+            );
+            assert_eq!(
+                encode(centre.into(), precision).unwrap(),
+                hash,
+                "centre of cell ({i}, {j}) at p{precision} should encode to {hash}"
+            );
+
+            let want = decode_bbox(&hash).unwrap();
+            for (label, w, g) in [
+                ("xmin", want.min().x, bbox.min().x),
+                ("ymin", want.min().y, bbox.min().y),
+                ("xmax", want.max().x, bbox.max().x),
+                ("ymax", want.max().y, bbox.max().y),
+            ] {
+                assert!((w - g).abs() < 1e-9, "{hash}: {label} {w} != {g}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_ghbits_axis_bits_total_five_per_character() {
+        for precision in 1..=ghbits::MAX_PRECISION {
+            let (lon_bits, lat_bits) = ghbits::axis_bits(precision);
+            assert_eq!(lon_bits + lat_bits, 5 * precision as u32);
+            // Longitude takes the extra bit at odd totals; never more than one extra.
+            assert!(lon_bits >= lat_bits && lon_bits - lat_bits <= 1);
+        }
+    }
+
     // ── polygons_to_geohashes ────────────────────────────────────────────────
 
     fn rect_polygon(xmin: f64, ymin: f64, xmax: f64, ymax: f64) -> Polygon {
@@ -1034,83 +1287,191 @@ mod tests {
             assert_eq!(ab, ba, "fully_contained_only={fully_contained_only}");
         }
     }
-}
 
-// ── Interior seed (existing) ──────────────────────────────────────────────────
-
-/// Ultra-fast interior seed with no RNG, no runtime trig.
-/// Fixed set of offsets → tight upper bound on `contains` calls.
-pub fn seed_interior_point_fast(poly: &Polygon) -> Option<Point> {
-    let bbox: Rect = poly.bounding_rect()?;
-    let (minx, miny, maxx, maxy) = (bbox.min().x, bbox.min().y, bbox.max().x, bbox.max().y);
-    let bx = (maxx - minx).abs();
-    let by = (maxy - miny).abs();
-    let span = bx.max(by);
-
-    // 1) centroid
-    if let Some(c) = poly.centroid() {
-        if poly.contains(&c) {
-            return Some(c);
+    /// Geometry outside the geohash domain must error, not clamp: `cover_range`
+    /// snaps indices onto the grid, so without the up-front check a polygon past
+    /// the antimeridian covers nothing and one straddling it covers only the
+    /// in-range half — both silently.
+    #[test]
+    fn test_out_of_range_polygons_are_rejected() {
+        let beyond_antimeridian = rect_polygon(185.0, 10.0, 186.0, 11.0);
+        let beyond_pole = rect_polygon(10.0, 90.5, 11.0, 91.0);
+        let straddling = rect_polygon(179.5, 10.0, 180.5, 11.0);
+        for polygon in [beyond_antimeridian, beyond_pole, straddling] {
+            for fully_contained_only in [false, true] {
+                assert!(
+                    polygons_to_geohashes(vec![polygon.clone()], 6, fully_contained_only).is_err(),
+                    "fully_contained_only={fully_contained_only}: expected an error for bbox {:?}",
+                    polygon.bounding_rect().unwrap()
+                );
+            }
         }
+        // The domain boundary itself is fine.
+        let boundary = rect_polygon(179.0, 89.0, 180.0, 90.0);
+        assert!(polygons_to_geohashes(vec![boundary], 4, false).is_ok());
+    }
 
-        // 2) deterministic offsets around centroid (approximate unit circle, no trig)
-        // 12 directions × 2 radii = 24 probes. Change radii for stricter/looser search.
-        // Offsets are normalized-ish; we scale by bbox span to move off boundary.
-        const OFFS: &[(f64, f64)] = &[
-            // 12-direction star (clockwise), integer-friendly
-            (1.0, 0.0),
-            (0.866, 0.5),
-            (0.5, 0.866),
-            (0.0, 1.0),
-            (-0.5, 0.866),
-            (-0.866, 0.5),
-            (-1.0, 0.0),
-            (-0.866, -0.5),
-            (-0.5, -0.866),
-            (0.0, -1.0),
-            (0.5, -0.866),
-            (0.866, -0.5),
+    /// An inner cover keeps cells that touch the polygon boundary without
+    /// crossing it: containment is DE-9IM `contains` — interior inside, the
+    /// boundaries allowed to meet — matching shapely and how holed polygons
+    /// were always treated.
+    ///
+    /// This is a deliberate semantics change. The pre-descent fast path for
+    /// hole-free polygons rejected boundary-touching cells, so a cell-aligned
+    /// polygon like this one used to yield only the 12 interior children
+    /// instead of all 32. It only shows on grid-aligned geometry; off the grid
+    /// lines a boundary cell genuinely crosses the edge and is excluded either
+    /// way.
+    #[test]
+    fn test_inner_cover_keeps_boundary_touching_cells() {
+        let hash = "f2h30";
+        let bbox = decode_bbox(hash).unwrap();
+        let polygon = rect_polygon(bbox.min().x, bbox.min().y, bbox.max().x, bbox.max().y);
+
+        let cover = polygons_to_geohashes(vec![polygon], 6, true).unwrap();
+
+        let all_children: HashSet<String> = ghbits::BASE32
+            .iter()
+            .map(|&c| format!("{hash}{}", c as char))
+            .collect();
+        assert_eq!(cover, all_children);
+    }
+
+    // ── polygons_to_geohashes: hierarchical descent ──────────────────────────
+
+    /// Independent oracle: test every cell in the bounding box directly, with no
+    /// descent, no prepared geometry and no tree walk. Slow, so keep precision low.
+    fn brute_force_cover(
+        polygons: &[Polygon],
+        precision: usize,
+        fully_contained_only: bool,
+    ) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for polygon in polygons {
+            let bbox = polygon.bounding_rect().unwrap();
+            let (i0, i1, j0, j1) = cover_range(&bbox, precision);
+            for i in i0..=i1 {
+                for j in j0..=j1 {
+                    let cell = ghbits::merge(i, j, precision);
+                    let cell_poly = ghbits::bbox(cell, precision).to_polygon();
+                    let hit = if fully_contained_only {
+                        polygon.contains(&cell_poly)
+                    } else {
+                        polygon.intersects(&cell_poly)
+                    };
+                    if hit {
+                        out.insert(ghbits::unpack(cell, precision));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn load_fixture(wkt_str: &str) -> Vec<Polygon> {
+        use wkt::TryFromWkt;
+        let multi: geo::MultiPolygon<f64> = geo::MultiPolygon::try_from_wkt_str(wkt_str).unwrap();
+        multi.0
+    }
+
+    #[test]
+    fn test_matches_brute_force_on_fixtures() {
+        // Precisions chosen so both flags yield a non-trivial cover while the
+        // brute-force oracle stays cheap enough for a debug build.
+        let fixtures = [
+            (
+                "verdun",
+                include_str!("../tests/data/verdun_wkt.txt"),
+                [6usize, 7],
+            ),
+            (
+                "whitehorse",
+                include_str!("../tests/data/whitehorse_wkt.txt"),
+                [4, 5],
+            ),
         ];
-        // Very small step first to clear boundary noise; then a modest step
-        let r1 = (span * 1e-6).max(1e-9);
-        let r2 = span * 1e-4;
-
-        // Elliptical scaling helps thin polygons aligned to axes
-        let sx = if span > 0.0 { bx / span } else { 1.0 };
-        let sy = if span > 0.0 { by / span } else { 1.0 };
-
-        // Try r1 then r2
-        for &r in &[r1, r2] {
-            for &(dx, dy) in OFFS {
-                let p = Point::new(c.x() + dx * r * sx, c.y() + dy * r * sy);
-                if poly.contains(&p) {
-                    return Some(p);
+        for (name, wkt_str, precisions) in fixtures {
+            let parts = load_fixture(wkt_str);
+            for precision in precisions {
+                for fully_contained_only in [false, true] {
+                    let got = polygons_to_geohashes(parts.clone(), precision, fully_contained_only)
+                        .unwrap();
+                    let want = brute_force_cover(&parts, precision, fully_contained_only);
+                    assert_eq!(
+                        got,
+                        want,
+                        "{name} p{precision} fully_contained_only={fully_contained_only}: +{} -{}",
+                        got.difference(&want).count(),
+                        want.difference(&got).count()
+                    );
+                    assert!(
+                        !want.is_empty(),
+                        "{name} p{precision} fully_contained_only={fully_contained_only} is a \
+                         vacuous case — pick a finer precision"
+                    );
                 }
             }
         }
     }
 
-    // 3) bbox center
-    let center = Point::new((minx + maxx) * 0.5, (miny + maxy) * 0.5);
-    if poly.contains(&center) {
-        return Some(center);
-    }
-
-    // 4) tiny fixed 4×4 grid inside bbox (16 probes, deterministic)
-    let nx = 4usize;
-    let ny = 4usize;
-    let stepx = bx / ((nx as f64) + 1.0);
-    let stepy = by / ((ny as f64) + 1.0);
-    for ix in 1..=nx {
-        for iy in 1..=ny {
-            let p = Point::new(minx + stepx * ix as f64, miny + stepy * iy as f64);
-            if poly.contains(&p) {
-                return Some(p);
-            }
+    #[test]
+    fn test_precision_out_of_range_is_rejected() {
+        let square = rect_polygon(-73.60, 45.50, -73.55, 45.55);
+        for precision in [0usize, 13, 64] {
+            assert!(
+                polygons_to_geohashes(vec![square.clone()], precision, false).is_err(),
+                "precision {precision} should be rejected"
+            );
         }
     }
 
-    // 5) guaranteed interior point from geo (handles thin/concave polygons where
-    //    all fast probes fall inside the hollow region)
-    poly.interior_point()
+    /// A polygon flush against the geohash grid must still reach the cells it
+    /// only touches along that grid line. Taking `floor` for the lower index
+    /// would leave the west and south neighbours outside the seed range, and
+    /// the descent only ever visits what it was seeded with — so `relate` would
+    /// never get the chance to accept them.
+    #[test]
+    fn test_grid_aligned_polygon_reaches_touching_neighbours() {
+        let precision = 5;
+        let (lon_bits, lat_bits) = ghbits::axis_bits(precision);
+        let lon_span = 360.0 / (1u64 << lon_bits) as f64;
+        let lat_span = 180.0 / (1u64 << lat_bits) as f64;
+        // Mid-latitude, so the cell has all eight neighbours and none of the
+        // indices below clamp against an edge of the grid.
+        let lon_i = ((-73.6 + 180.0) / lon_span).floor() as u64;
+        let lat_j = ((45.5 + 90.0) / lat_span).floor() as u64;
+
+        // The polygon *is* one cell, so its bounding box lies exactly on grid
+        // lines on all four sides.
+        let cell = ghbits::merge(lon_i, lat_j, precision);
+        let polygon = ghbits::bbox(cell, precision).to_polygon();
+
+        let got = polygons_to_geohashes(vec![polygon], precision, false).unwrap();
+
+        let want: HashSet<String> = (lon_i - 1..=lon_i + 1)
+            .flat_map(|i| {
+                (lat_j - 1..=lat_j + 1)
+                    .map(move |j| ghbits::unpack(ghbits::merge(i, j, precision), precision))
+            })
+            .collect();
+        assert_eq!(
+            got, want,
+            "the cell and its eight touching neighbours should all be covered"
+        );
+    }
+
+    /// The cover must refine consistently: every p6 cell's parent is a p5 cell.
+    #[test]
+    fn test_cover_refines_consistently() {
+        let square = rect_polygon(-73.60, 45.50, -73.55, 45.55);
+        let coarse = polygons_to_geohashes(vec![square.clone()], 5, false).unwrap();
+        let fine = polygons_to_geohashes(vec![square], 6, false).unwrap();
+        assert!(!fine.is_empty());
+        for hash in &fine {
+            assert!(
+                coarse.contains(&hash[..5]),
+                "p6 cell {hash} has no p5 parent in the coarse cover"
+            );
+        }
+    }
 }

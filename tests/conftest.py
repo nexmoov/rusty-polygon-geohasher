@@ -19,10 +19,10 @@ def polygon_verdun():
 def polygon_crescent():
     """Thin C-shaped ring whose centroid lies in the hollow interior.
 
-    All fast interior probes (centroid, 24 offsets, bbox center, 4×4 grid)
-    fall inside the hollow region and miss the thin ring body, which exposed
-    the seed-point fallback bug where the BFS would start outside the polygon
-    and return an empty result.
+    An awkward shape for any cover: the centroid, the bounding-box centre and
+    most of the bounding box are outside the polygon, and the ring body is only
+    0.01 degrees thick. A cover that reasons from an interior point rather than
+    from the geometry returns nothing at all here.
     """
     center_lon, center_lat = -73.5, 45.5
     outer_r, inner_r = 0.5, 0.49

@@ -1207,6 +1207,7 @@ dependencies = [
  "pyo3-arrow",
  "queue",
  "rayon",
+ "rustc-hash",
  "wkt",
 ]
 

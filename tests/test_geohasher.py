@@ -82,6 +82,41 @@ def test_exception_when_invalid(polygon, exception_message_idx):
         geohash_polygon.polygon_to_geohashes(polygon, 3, True)
 
 
+def test_inner_cover_keeps_boundary_touching_cells():
+    """An inner cover keeps cells that touch the polygon boundary without
+    crossing it, matching shapely's ``contains``: a polygon equal to one
+    precision-5 cell contains all 32 of its precision-6 children, including
+    the 20 whose outer edges lie exactly on the polygon boundary.
+
+    Deliberate semantics change: the pre-descent fast path for hole-free
+    polygons rejected touching cells, returning only the 12 interior children
+    for this grid-aligned input.
+    """
+    lng, lat, lng_err, lat_err = geohash_polygon.decode_exactly("f2h30")
+    polygon = shapely.geometry.box(lng - lng_err, lat - lat_err, lng + lng_err, lat + lat_err)
+    result = geohash_polygon.polygon_to_geohashes(polygon, 6, True)
+    base32 = "0123456789bcdefghjkmnpqrstuvwxyz"
+    assert result == {f"f2h30{c}" for c in base32}
+
+
+@pytest.mark.parametrize(
+    "coords",
+    [
+        # Entirely past the antimeridian.
+        [(185.0, 10.0), (186.0, 10.0), (186.0, 11.0), (185.0, 11.0)],
+        # Entirely past the pole.
+        [(10.0, 90.5), (11.0, 90.5), (11.0, 91.0), (10.0, 91.0)],
+        # Straddling the antimeridian: an error, not a half cover.
+        [(179.5, 10.0), (180.5, 10.0), (180.5, 11.0), (179.5, 11.0)],
+    ],
+)
+@pytest.mark.parametrize("inner", [False, True])
+def test_out_of_range_polygon_raises(coords, inner):
+    polygon = shapely.geometry.Polygon(coords)
+    with pytest.raises(ValueError, match=r"InvalidCoordinateRange"):
+        geohash_polygon.polygon_to_geohashes(polygon, 6, inner)
+
+
 @pytest.mark.parametrize(
     "level, inner",
     [
@@ -179,9 +214,9 @@ def test_verdun(level, inner, polygon_verdun):
 def test_crescent(level, inner, polygon_crescent):
     """Thin C-shaped polygon whose centroid is outside the polygon body.
 
-    Before the interior_point() fallback was added, seed_interior_point_fast
-    returned None and the caller fell back to the bbox center, which also lies
-    outside the ring, causing the BFS to return an empty set.
+    Nothing about the shape is reachable from its centroid or its bounding-box
+    centre, both of which sit in the hollow. Historically that returned an empty
+    set; the cover now descends from the grid, so no interior point is involved.
     """
     result = geohash_polygon.polygon_to_geohashes(polygon_crescent, level, inner)
     reference = polygon_to_geohashes_py(polygon_crescent, level, inner)
