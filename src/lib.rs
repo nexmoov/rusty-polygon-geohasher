@@ -1,7 +1,10 @@
 use geo::{BoundingRect, Intersects, Polygon, PreparedGeometry, Rect, Relate};
 
 use arrow_array::builder::LargeStringBuilder;
-use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StringArray};
+use arrow_array::{
+    Array, ArrayRef, LargeBinaryArray, LargeStringArray, ListArray, RecordBatch, StringArray,
+};
+use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
 use arrow_schema::{DataType, Field, Schema};
 use geohash::{decode_bbox, encode, GeohashError};
 use pyo3::prelude::*;
@@ -616,36 +619,221 @@ fn decode_many_exactly(
         .collect()
 }
 
-/// Serialize a bounding box as a little-endian WKB or EWKB polygon (1 ring, 5 points, closed).
+// ── Arrow bulk codec ─────────────────────────────────────────────────────────
+
+/// A borrowed Arrow string column, whichever offset width it uses.
 ///
-/// Pass `srid: None` for plain WKB (93 bytes). Pass `srid: Some(s)` for EWKB (97 bytes),
-/// which sets the SRID flag (0x20000000) in the type field and inserts a 4-byte SRID.
+/// Lets the Arrow entry points accept both `Utf8` and `LargeUtf8` without
+/// duplicating every function, and hands out `&str` borrowed straight from the
+/// Arrow buffer — no copy, no Python object.
+enum StringColumn<'a> {
+    Utf8(&'a StringArray),
+    LargeUtf8(&'a LargeStringArray),
+}
+
+impl<'a> StringColumn<'a> {
+    fn new(array: &'a dyn Array, argument: &str) -> PyResult<Self> {
+        if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
+            Ok(Self::Utf8(a))
+        } else if let Some(a) = array.as_any().downcast_ref::<LargeStringArray>() {
+            Ok(Self::LargeUtf8(a))
+        } else {
+            Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "{argument} must be a Utf8 or LargeUtf8 Array, got {}",
+                array.data_type()
+            )))
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Utf8(a) => a.len(),
+            Self::LargeUtf8(a) => a.len(),
+        }
+    }
+
+    #[inline]
+    fn is_null(&self, i: usize) -> bool {
+        match self {
+            Self::Utf8(a) => a.is_null(i),
+            Self::LargeUtf8(a) => a.is_null(i),
+        }
+    }
+
+    #[inline]
+    fn value(&self, i: usize) -> &'a str {
+        match self {
+            Self::Utf8(a) => a.value(i),
+            Self::LargeUtf8(a) => a.value(i),
+        }
+    }
+
+    fn nulls(&self) -> Option<NullBuffer> {
+        match self {
+            Self::Utf8(a) => a.nulls().cloned(),
+            Self::LargeUtf8(a) => a.nulls().cloned(),
+        }
+    }
+}
+
+/// Decode a geohash column into a `LargeBinary` column of WKB or EWKB polygons.
+///
+/// Every row serializes to the same width, so the whole values buffer is
+/// allocated once and filled across threads in place. Null inputs stay null and
+/// leave their slot zeroed.
+fn geohashes_to_wkb_column(
+    hashes: &StringColumn<'_>,
+    srid: Option<u32>,
+) -> Result<LargeBinaryArray, GeohashError> {
+    let width = wkb_width(srid);
+    let rows = hashes.len();
+    let mut values = vec![0u8; rows * width];
+
+    values
+        .par_chunks_exact_mut(width)
+        .enumerate()
+        .try_for_each(|(i, slot)| -> Result<(), GeohashError> {
+            if hashes.is_null(i) {
+                return Ok(());
+            }
+            let bbox = decode_bbox(hashes.value(i))?;
+            write_bbox(
+                slot,
+                bbox.min().x,
+                bbox.min().y,
+                bbox.max().x,
+                bbox.max().y,
+                srid,
+            );
+            Ok(())
+        })?;
+
+    let offsets = OffsetBuffer::from_lengths(std::iter::repeat_n(width, rows));
+    Ok(LargeBinaryArray::new(
+        offsets,
+        Buffer::from_vec(values),
+        hashes.nulls(),
+    ))
+}
+
+/// Shared body of `decode_many_to_wkb_arrow` and `decode_many_to_ewkb_arrow`.
+fn decode_many_to_wkb_arrow_impl(
+    py: Python<'_>,
+    geohashes: pyo3_arrow::PyArray,
+    srid: Option<u32>,
+    num_threads: Option<usize>,
+) -> PyResult<pyo3_arrow::PyArray> {
+    let pool = make_pool(num_threads)?;
+    let (array, _) = geohashes.into_inner();
+    let hashes = StringColumn::new(array.as_ref(), "geohashes")?;
+
+    let column = py
+        .detach(|| run_with_pool(&pool, || geohashes_to_wkb_column(&hashes, srid)))
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+    Ok(pyo3_arrow::PyArray::from_array_ref(Arc::new(column)))
+}
+
+/// Decode a geohash Array to a `LargeBinary` Array of WKB polygon bounding boxes.
+///
+/// The Arrow twin of `decode_many_to_wkb`. Strings are read straight from the
+/// input's buffers and the output is built into Arrow buffers, so no Python
+/// object is created per row — for large columns that boundary, not the
+/// geometry, is nearly all of the cost.
+///
+/// Accepts a `Utf8` or `LargeUtf8` PyArrow `Array` (not a ChunkedArray — call
+/// `.combine_chunks()` first). Null inputs produce null outputs.
+#[pyfunction]
+#[pyo3(signature = (geohashes, num_threads=None))]
+fn decode_many_to_wkb_arrow(
+    py: Python<'_>,
+    geohashes: pyo3_arrow::PyArray,
+    num_threads: Option<usize>,
+) -> PyResult<pyo3_arrow::PyArray> {
+    decode_many_to_wkb_arrow_impl(py, geohashes, None, num_threads)
+}
+
+/// Decode a geohash Array to a `LargeBinary` Array of EWKB polygons with an SRID.
+///
+/// The Arrow twin of `decode_many_to_ewkb`; see `decode_many_to_wkb_arrow`.
+#[pyfunction]
+#[pyo3(signature = (geohashes, srid=4326, num_threads=None))]
+fn decode_many_to_ewkb_arrow(
+    py: Python<'_>,
+    geohashes: pyo3_arrow::PyArray,
+    srid: u32,
+    num_threads: Option<usize>,
+) -> PyResult<pyo3_arrow::PyArray> {
+    decode_many_to_wkb_arrow_impl(py, geohashes, Some(srid), num_threads)
+}
+
+/// Byte width of one serialized bbox: 93 for WKB, 97 for EWKB (4 more for the SRID).
 #[inline]
-fn serialize_bbox(xmin: f64, ymin: f64, xmax: f64, ymax: f64, srid: Option<u32>) -> Vec<u8> {
-    let capacity = if srid.is_some() { 97 } else { 93 };
+const fn wkb_width(srid: Option<u32>) -> usize {
+    if srid.is_some() {
+        97
+    } else {
+        93
+    }
+}
+
+/// Write a bounding box into `out` as a little-endian WKB or EWKB polygon
+/// (1 ring, 5 points, closed).
+///
+/// `out` must be exactly [`wkb_width`] bytes. Writing in place lets a whole
+/// column be filled across threads with one allocation for the entire buffer,
+/// rather than a `Vec` per row.
+///
+/// Pass `srid: None` for plain WKB. Pass `srid: Some(s)` for EWKB, which sets the
+/// SRID flag (0x20000000) in the type field and inserts a 4-byte SRID.
+#[inline]
+fn write_bbox(out: &mut [u8], xmin: f64, ymin: f64, xmax: f64, ymax: f64, srid: Option<u32>) {
+    debug_assert_eq!(out.len(), wkb_width(srid));
     let wkb_type = if srid.is_some() {
         3u32 | 0x20000000u32
     } else {
         3u32
     };
-    let mut buf = Vec::with_capacity(capacity);
-    buf.push(0x01u8);
-    buf.extend_from_slice(&wkb_type.to_le_bytes());
-    if let Some(s) = srid {
-        buf.extend_from_slice(&s.to_le_bytes());
+
+    let mut at = 0;
+    {
+        let mut put = |bytes: &[u8]| {
+            out[at..at + bytes.len()].copy_from_slice(bytes);
+            at += bytes.len();
+        };
+
+        put(&[0x01u8]); // little-endian
+        put(&wkb_type.to_le_bytes());
+        if let Some(s) = srid {
+            put(&s.to_le_bytes());
+        }
+        put(&1u32.to_le_bytes()); // number of rings
+        put(&5u32.to_le_bytes()); // number of points (closed ring)
+        for (x, y) in [
+            (xmin, ymin),
+            (xmax, ymin),
+            (xmax, ymax),
+            (xmin, ymax),
+            (xmin, ymin), // close the ring
+        ] {
+            put(&x.to_le_bytes());
+            put(&y.to_le_bytes());
+        }
     }
-    buf.extend_from_slice(&1u32.to_le_bytes()); // number of rings
-    buf.extend_from_slice(&5u32.to_le_bytes()); // number of points (closed ring)
-    for (x, y) in [
-        (xmin, ymin),
-        (xmax, ymin),
-        (xmax, ymax),
-        (xmin, ymax),
-        (xmin, ymin), // close the ring
-    ] {
-        buf.extend_from_slice(&x.to_le_bytes());
-        buf.extend_from_slice(&y.to_le_bytes());
-    }
+
+    // `at` is what the writes above actually consumed; `wkb_width` is what the
+    // column builder allocated per row. A new field added to the layout without
+    // a matching bump to `wkb_width` would otherwise silently truncate or run
+    // into the next row's slot.
+    debug_assert_eq!(at, out.len(), "write_bbox did not fill its slot exactly");
+}
+
+/// Allocating form of [`write_bbox`], for the list-returning Python API.
+#[inline]
+fn serialize_bbox(xmin: f64, ymin: f64, xmax: f64, ymax: f64, srid: Option<u32>) -> Vec<u8> {
+    let mut buf = vec![0u8; wkb_width(srid)];
+    write_bbox(&mut buf, xmin, ymin, xmax, ymax, srid);
     buf
 }
 
@@ -1030,6 +1218,8 @@ fn geohash_polygon(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode_many_exactly, m)?)?;
     m.add_function(wrap_pyfunction!(decode_many_to_wkb, m)?)?;
     m.add_function(wrap_pyfunction!(decode_many_to_ewkb, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_many_to_wkb_arrow, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_many_to_ewkb_arrow, m)?)?;
     m.add_function(wrap_pyfunction!(expand_geohashes, m)?)?;
     m.add_function(wrap_pyfunction!(expand_geohash_mapping, m)?)?;
     m.add_function(wrap_pyfunction!(expand_geohash_mapping_arrow, m)?)?;
@@ -1899,5 +2089,85 @@ mod tests {
         let polar = "zzzzzzzzz";
         assert!(n_hops_for_group_core([polar, sane], 1000.0).is_err());
         assert!(n_hops_for_group_core([sane, polar], 1000.0).is_err());
+    }
+
+    // ── Arrow WKB column ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_wkb_column_matches_the_list_api() {
+        let hashes = ["dr5ru7", "dpz8zzzz", "9q8yy9ve"];
+        let array = StringArray::from(hashes.to_vec());
+        let column = geohashes_to_wkb_column(&StringColumn::Utf8(&array), None).unwrap();
+
+        assert_eq!(column.len(), hashes.len());
+        assert_eq!(column.null_count(), 0);
+        for (i, hash) in hashes.iter().enumerate() {
+            let expected = decode_bbox(hash).unwrap();
+            let (xmin, ymin, xmax, ymax) = parse_polygon_bbox(column.value(i), None);
+            assert_eq!(xmin, expected.min().x, "xmin at {i} ({hash})");
+            assert_eq!(ymin, expected.min().y, "ymin at {i} ({hash})");
+            assert_eq!(xmax, expected.max().x, "xmax at {i} ({hash})");
+            assert_eq!(ymax, expected.max().y, "ymax at {i} ({hash})");
+        }
+    }
+
+    #[test]
+    fn test_wkb_column_carries_the_srid() {
+        let array = StringArray::from(vec!["dr5ru7"]);
+        let column = geohashes_to_wkb_column(&StringColumn::Utf8(&array), Some(32632)).unwrap();
+        assert_eq!(column.value(0).len(), 97);
+        parse_polygon_bbox(column.value(0), Some(32632));
+    }
+
+    #[test]
+    fn test_wkb_column_preserves_nulls() {
+        let array = StringArray::from(vec![Some("dr5ru7"), None, Some("dpz8zzzz")]);
+        let column = geohashes_to_wkb_column(&StringColumn::Utf8(&array), None).unwrap();
+        assert_eq!(column.len(), 3);
+        assert!(!column.is_null(0));
+        assert!(column.is_null(1), "null input must stay null");
+        assert!(!column.is_null(2));
+        // The surviving rows are unaffected by the hole between them.
+        let expected = decode_bbox("dpz8zzzz").unwrap();
+        let (xmin, _, _, ymax) = parse_polygon_bbox(column.value(2), None);
+        assert_eq!(xmin, expected.min().x);
+        assert_eq!(ymax, expected.max().y);
+    }
+
+    #[test]
+    fn test_wkb_column_accepts_large_utf8() {
+        let small = StringArray::from(vec!["dr5ru7", "9q8yy9ve"]);
+        let large = LargeStringArray::from(vec!["dr5ru7", "9q8yy9ve"]);
+        let from_small = geohashes_to_wkb_column(&StringColumn::Utf8(&small), None).unwrap();
+        let from_large = geohashes_to_wkb_column(&StringColumn::LargeUtf8(&large), None).unwrap();
+        assert_eq!(from_small.value(0), from_large.value(0));
+        assert_eq!(from_small.value(1), from_large.value(1));
+    }
+
+    #[test]
+    fn test_wkb_column_empty() {
+        let array = StringArray::from(Vec::<&str>::new());
+        let column = geohashes_to_wkb_column(&StringColumn::Utf8(&array), None).unwrap();
+        assert_eq!(column.len(), 0);
+    }
+
+    #[test]
+    fn test_wkb_column_rejects_invalid_geohash() {
+        let array = StringArray::from(vec!["dr5ru7", "not-a-geohash!"]);
+        assert!(geohashes_to_wkb_column(&StringColumn::Utf8(&array), None).is_err());
+    }
+
+    /// A sliced input must be read through its offset, not from the start of the
+    /// parent's buffers.
+    #[test]
+    fn test_wkb_column_handles_a_sliced_input() {
+        let array = StringArray::from(vec!["dr5ru7", "dpz8zzzz", "9q8yy9ve"]);
+        let sliced = array.slice(1, 2);
+        let column = geohashes_to_wkb_column(&StringColumn::Utf8(&sliced), None).unwrap();
+        assert_eq!(column.len(), 2);
+        let expected = decode_bbox("dpz8zzzz").unwrap();
+        let (xmin, ymin, _, _) = parse_polygon_bbox(column.value(0), None);
+        assert_eq!(xmin, expected.min().x);
+        assert_eq!(ymin, expected.min().y);
     }
 }

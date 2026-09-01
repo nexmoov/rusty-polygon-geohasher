@@ -1198,6 +1198,7 @@ name = "rusty-polygon-geohasher"
 version = "0.6.4"
 dependencies = [
  "arrow-array",
+ "arrow-buffer",
  "arrow-schema",
  "criterion",
  "geo",
