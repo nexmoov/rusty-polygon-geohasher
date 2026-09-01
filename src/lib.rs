@@ -192,6 +192,19 @@ where
     }
 }
 
+/// [`decode_bbox`] that rejects the empty string.
+///
+/// The `geohash` crate decodes `""` to the whole-world bbox, so an empty value
+/// that slips in from an upstream join would quietly become a polygon covering
+/// the planet instead of an error. Every decode of user input goes through
+/// here.
+fn checked_decode_bbox(hash: &str) -> Result<Rect<f64>, GeohashError> {
+    if hash.is_empty() {
+        return Err(GeohashError::InvalidLength(0));
+    }
+    decode_bbox(hash)
+}
+
 /// Locate the character that stopped [`ghbits::pack`], for the error path.
 fn invalid_hash_error(hash: &str) -> GeohashError {
     let bad = hash
@@ -683,7 +696,7 @@ fn encode_many(
 /// Decode a geohash to (lng, lat, lng_err, lat_err) — lng-first, matching encode convention.
 #[pyfunction]
 fn decode_exactly(hash_str: &str) -> PyResult<(f64, f64, f64, f64)> {
-    let bbox = decode_bbox(hash_str)
+    let bbox = checked_decode_bbox(hash_str)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     let lat = (bbox.min().y + bbox.max().y) / 2.0;
     let lng = (bbox.min().x + bbox.max().x) / 2.0;
@@ -706,7 +719,7 @@ fn decode_many(
             geohashes
                 .into_par_iter()
                 .map(|hash| {
-                    decode_bbox(&hash).map(|bbox| {
+                    checked_decode_bbox(&hash).map(|bbox| {
                         let lat = (bbox.min().y + bbox.max().y) / 2.0;
                         let lng = (bbox.min().x + bbox.max().x) / 2.0;
                         (lng, lat)
@@ -734,7 +747,7 @@ fn decode_many_exactly(
             geohashes
                 .into_par_iter()
                 .map(|hash| {
-                    decode_bbox(&hash).map(|bbox| {
+                    checked_decode_bbox(&hash).map(|bbox| {
                         let lat = (bbox.min().y + bbox.max().y) / 2.0;
                         let lng = (bbox.min().x + bbox.max().x) / 2.0;
                         let lat_err = (bbox.max().y - bbox.min().y) / 2.0;
@@ -828,7 +841,7 @@ fn geohashes_to_wkb_column(
             if hashes.is_null(i) {
                 return Ok(());
             }
-            let bbox = decode_bbox(hashes.value(i))?;
+            let bbox = checked_decode_bbox(hashes.value(i))?;
             write_bbox(
                 slot,
                 bbox.min().x,
@@ -1000,7 +1013,7 @@ fn geohashes_to_coord_columns(
                 if hashes.is_null(i) {
                     continue;
                 }
-                let bbox = decode_bbox(hashes.value(i))?;
+                let bbox = checked_decode_bbox(hashes.value(i))?;
                 cols[0][r] = (bbox.min().x + bbox.max().x) / 2.0;
                 cols[1][r] = (bbox.min().y + bbox.max().y) / 2.0;
                 if with_errors {
@@ -1198,7 +1211,7 @@ fn geohashes_to_bytes(
         geohashes
             .into_par_iter()
             .map(|hash| {
-                decode_bbox(&hash).map(|bbox| {
+                checked_decode_bbox(&hash).map(|bbox| {
                     serialize_bbox(bbox.min().x, bbox.min().y, bbox.max().x, bbox.max().y, srid)
                 })
             })
@@ -1283,7 +1296,7 @@ fn n_hops_for_core(sample_hash: &str, expansion_m: f64) -> Result<usize, String>
     if !expansion_m.is_finite() || expansion_m < 0.0 {
         return Err("expansion_m must be a finite non-negative number".to_string());
     }
-    let bbox = decode_bbox(sample_hash).map_err(|e| format!("invalid geohash: {e}"))?;
+    let bbox = checked_decode_bbox(sample_hash).map_err(|e| format!("invalid geohash: {e}"))?;
     let lat_center = (bbox.min().y + bbox.max().y) / 2.0;
     let cell_height_m = (bbox.max().y - bbox.min().y) * 111_000.0;
     let cell_width_m = (bbox.max().x - bbox.min().x) * 111_320.0 * lat_center.to_radians().cos();
@@ -1474,6 +1487,16 @@ fn expand_geohash_mapping_arrow(
     if let Some(i) = (0..n).find(|&i| geog_id_arr.is_null(i)) {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "geog_ids contains a null at index {i}"
+        )));
+    }
+    // A null list slot is not "no geohashes": the Arrow spec lets a null slot's
+    // offsets span arbitrary positions of the values buffer, so reading through
+    // them could expand undefined data. A geography with no geohashes is an
+    // empty list.
+    if let Some(i) = (0..n).find(|&i| list_arr.is_null(i)) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "geohash_lists contains a null at index {i}; pass an empty list for a \
+             geography with no geohashes"
         )));
     }
     let offsets = list_arr.offsets();
@@ -2633,6 +2656,17 @@ mod tests {
     fn test_wkb_column_rejects_invalid_geohash() {
         let array = StringArray::from(vec!["dr5ru7", "not-a-geohash!"]);
         assert!(geohashes_to_wkb_column(&StringColumn::Utf8(&array), None).is_err());
+    }
+
+    /// The `geohash` crate decodes `""` to the whole-world bbox; every decode
+    /// of user input must refuse it instead.
+    #[test]
+    fn test_empty_geohash_is_rejected() {
+        assert!(checked_decode_bbox("").is_err());
+        let array = StringArray::from(vec![""]);
+        assert!(geohashes_to_wkb_column(&StringColumn::Utf8(&array), None).is_err());
+        assert!(geohashes_to_coord_columns(&StringColumn::Utf8(&array), true).is_err());
+        assert!(n_hops_for_core("", 100.0).is_err());
     }
 
     /// A sliced input must be read through its offset, not from the start of the
