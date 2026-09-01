@@ -1,3 +1,4 @@
+import os
 import shapely
 import geohash_polygon
 from polygon_geohasher.polygon_geohasher import (
@@ -249,3 +250,62 @@ def test_hole(level, inner, polygon_hole):
     assert geohash_polygon.polygon_to_geohashes(
         polygon_hole, level, inner
     ) == polygon_to_geohashes_py(polygon_hole, level, inner)
+
+
+@pytest.mark.skipif(
+    (os.cpu_count() or 1) < 2,
+    reason="two CPU-bound threads cannot overlap on a single core, GIL or not",
+)
+def test_polygon_to_geohashes_releases_the_gil(polygon_verdun):
+    """The cover walk must not hold the GIL.
+
+    Two concurrent calls should overlap rather than serialise. If the GIL were
+    held for the whole walk, the pair would take about twice a single call.
+    """
+    import threading
+    import time
+
+    precision = 9
+    # One call is short enough that thread start-up and scheduler noise move the
+    # ratio by more than the effect being measured. Repeating inside each timing
+    # makes the walk itself dominate.
+    repeats = 10
+
+    def cover():
+        for _ in range(repeats):
+            geohash_polygon.polygon_to_geohashes(polygon_verdun, precision, False)
+
+    # Warm up so neither timing pays one-off costs.
+    cover()
+
+    start = time.perf_counter()
+    cover()
+    single = time.perf_counter() - start
+
+    # Threads start one at a time, so without a gate the first would have a head
+    # start on the second and the pair would look more overlapped than it is.
+    gate = threading.Barrier(3)
+    failures = []
+
+    def work():
+        gate.wait()
+        try:
+            cover()
+        except Exception as exc:  # threading swallows these otherwise
+            failures.append(exc)
+
+    threads = [threading.Thread(target=work) for _ in range(2)]
+    for t in threads:
+        t.start()
+    gate.wait()
+    start = time.perf_counter()
+    for t in threads:
+        t.join()
+    concurrent = time.perf_counter() - start
+    assert not failures, f"worker thread raised: {failures[0]!r}"
+
+    # Serialised would be ~2.0x. Allow generous headroom for a loaded machine.
+    assert concurrent < single * 1.7, (
+        f"two concurrent calls took {concurrent:.3f}s against {single:.3f}s for one "
+        f"({concurrent / single:.2f}x) — the GIL looks held for the duration"
+    )

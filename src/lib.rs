@@ -528,7 +528,7 @@ fn extract_multipolygon(coordinates: &Bound<'_, PyAny>) -> PyResult<Vec<Polygon<
 
 #[pyfunction]
 fn polygon_to_geohashes(
-    _py: Python,
+    py: Python<'_>,
     py_polygon: Bound<'_, PyAny>,
     precision: usize,
     inner: bool,
@@ -569,7 +569,10 @@ fn polygon_to_geohashes(
         }
     };
 
-    polygons_to_geohashes(polygons, precision, inner)
+    // The cover walk touches no Python objects, and at fine precisions it runs for
+    // seconds — verdun at precision 10 takes minutes. Hold the GIL for the
+    // __geo_interface__ read above only, not for the geometry.
+    py.detach(|| polygons_to_geohashes(polygons, precision, inner))
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{e:?}")))
 }
 
