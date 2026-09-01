@@ -38,6 +38,43 @@ def decode_many_to_ewkb(
     num_threads: int | None = None,
 ) -> list[bytes]: ...
 
+def encode_many_arrow(
+    lngs: Any,
+    lats: Any,
+    precision: int,
+    num_threads: int | None = None,
+) -> Any:
+    """Encode coordinate Arrays to geohashes, via Arrow.
+
+    lngs, lats: pyarrow Float64 Arrays of equal length (single chunk)
+    Returns a LargeUtf8 Array; a row is null if either coordinate is null.
+    Convert to pyarrow via pa.array(result).
+    """
+    ...
+
+def decode_many_arrow(
+    geohashes: Any,
+    num_threads: int | None = None,
+) -> Any:
+    """Decode geohashes to cell centres, via Arrow.
+
+    geohashes: pyarrow Utf8 or LargeUtf8 Array (single chunk)
+    Returns a RecordBatch with schema (lng: Float64, lat: Float64).
+    Convert to pyarrow via pa.record_batch(result).
+    """
+    ...
+
+def decode_many_exactly_arrow(
+    geohashes: Any,
+    num_threads: int | None = None,
+) -> Any:
+    """Decode geohashes to centres and half-extents, via Arrow.
+
+    Returns a RecordBatch with schema
+    (lng, lat, lng_err, lat_err), all Float64.
+    """
+    ...
+
 def decode_many_to_wkb_arrow(
     geohashes: Any,
     num_threads: int | None = None,

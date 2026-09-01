@@ -225,3 +225,123 @@ def test_wkb_arrow_round_trips_a_larger_column():
     hashes = [geohash_polygon.encode(-73.5 + i * 1e-4, 45.5 + i * 1e-4, 7) for i in range(5000)]
     result = pa.array(geohash_polygon.decode_many_to_wkb_arrow(pa.array(hashes, type=pa.utf8())))
     assert result.to_pylist() == geohash_polygon.decode_many_to_wkb(hashes)
+
+
+# ── encode_many_arrow ─────────────────────────────────────────────────────────
+
+LNGS = [-76.6, -80.8501, -73.5540, 12.3456]
+LATS = [47.1, 35.204, 45.5088, -8.7654]
+
+
+def test_encode_arrow_matches_the_list_api():
+    result = pa.array(
+        geohash_polygon.encode_many_arrow(pa.array(LNGS), pa.array(LATS), 7)
+    )
+    assert result.type == pa.large_string()
+    assert result.to_pylist() == geohash_polygon.encode_many(LNGS, LATS, 7)
+
+
+def test_encode_arrow_row_length_is_the_precision():
+    for precision in range(1, 13):
+        result = pa.array(
+            geohash_polygon.encode_many_arrow(pa.array(LNGS), pa.array(LATS), precision)
+        )
+        assert all(len(v) == precision for v in result.to_pylist())
+
+
+def test_encode_arrow_nulls_in_either_coordinate():
+    lngs = pa.array([-76.6, None, -73.5540])
+    lats = pa.array([47.1, 35.204, None])
+    result = pa.array(geohash_polygon.encode_many_arrow(lngs, lats, 6))
+    assert result.null_count == 2
+    assert result[0].as_py() == geohash_polygon.encode(-76.6, 47.1, 6)
+    assert result[1].as_py() is None
+    assert result[2].as_py() is None
+
+
+def test_encode_arrow_length_mismatch_raises():
+    with pytest.raises(ValueError, match="same length"):
+        geohash_polygon.encode_many_arrow(pa.array([1.0, 2.0]), pa.array([1.0]), 7)
+
+
+def test_encode_arrow_rejects_non_float_array():
+    with pytest.raises(ValueError, match="Float64"):
+        geohash_polygon.encode_many_arrow(
+            pa.array([1, 2], type=pa.int64()), pa.array([1.0, 2.0]), 7
+        )
+
+
+@pytest.mark.parametrize("precision", [0, 13, 100])
+def test_encode_arrow_rejects_bad_precision(precision):
+    with pytest.raises(ValueError, match="precision must be between"):
+        geohash_polygon.encode_many_arrow(pa.array(LNGS), pa.array(LATS), precision)
+
+
+def test_encode_arrow_empty():
+    result = pa.array(
+        geohash_polygon.encode_many_arrow(
+            pa.array([], type=pa.float64()), pa.array([], type=pa.float64()), 7
+        )
+    )
+    assert len(result) == 0
+
+
+# ── decode_many_arrow / decode_many_exactly_arrow ────────────────────────────
+
+
+def test_decode_arrow_matches_the_list_api():
+    batch = pa.record_batch(geohash_polygon.decode_many_arrow(pa.array(HASHES)))
+    assert batch.schema.names == ["lng", "lat"]
+    expected = geohash_polygon.decode_many(HASHES)
+    assert list(zip(batch["lng"].to_pylist(), batch["lat"].to_pylist())) == expected
+
+
+def test_decode_exactly_arrow_matches_the_list_api():
+    batch = pa.record_batch(geohash_polygon.decode_many_exactly_arrow(pa.array(HASHES)))
+    assert batch.schema.names == ["lng", "lat", "lng_err", "lat_err"]
+    expected = geohash_polygon.decode_many_exactly(HASHES)
+    got = list(
+        zip(
+            batch["lng"].to_pylist(),
+            batch["lat"].to_pylist(),
+            batch["lng_err"].to_pylist(),
+            batch["lat_err"].to_pylist(),
+        )
+    )
+    assert got == expected
+
+
+def test_decode_arrow_preserves_nulls():
+    batch = pa.record_batch(
+        geohash_polygon.decode_many_exactly_arrow(pa.array(["dr5ru7", None, "f2h30"]))
+    )
+    for name in batch.schema.names:
+        assert batch[name].null_count == 1
+        assert batch[name][1].as_py() is None
+
+
+def test_decode_arrow_accepts_large_utf8():
+    small = pa.record_batch(geohash_polygon.decode_many_arrow(pa.array(HASHES, type=pa.utf8())))
+    large = pa.record_batch(
+        geohash_polygon.decode_many_arrow(pa.array(HASHES, type=pa.large_utf8()))
+    )
+    assert small.to_pydict() == large.to_pydict()
+
+
+def test_decode_arrow_empty():
+    batch = pa.record_batch(geohash_polygon.decode_many_arrow(pa.array([], type=pa.utf8())))
+    assert batch.num_rows == 0
+    assert batch.schema.names == ["lng", "lat"]
+
+
+def test_decode_arrow_rejects_invalid_geohash():
+    with pytest.raises(ValueError):
+        geohash_polygon.decode_many_arrow(pa.array(["not-a-geohash!"]))
+
+
+def test_arrow_encode_decode_round_trip():
+    encoded = geohash_polygon.encode_many_arrow(pa.array(LNGS), pa.array(LATS), 9)
+    batch = pa.record_batch(geohash_polygon.decode_many_exactly_arrow(pa.array(encoded)))
+    for i, (lng, lat) in enumerate(zip(LNGS, LATS)):
+        assert abs(batch["lng"][i].as_py() - lng) <= batch["lng_err"][i].as_py()
+        assert abs(batch["lat"][i].as_py() - lat) <= batch["lat_err"][i].as_py()
