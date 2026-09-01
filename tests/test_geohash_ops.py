@@ -162,6 +162,53 @@ def test_expand_geohashes_invalid_hash_raises():
         geohash_polygon.expand_geohashes(["not_a_geohash!"], 0.10)
 
 
+def test_expand_geohashes_polar_runaway_raises():
+    """Near the poles a cell's width collapses, so the hop count explodes.
+
+    Without a cap this builds a frontier of billions of cells and never returns.
+    """
+    polar = "z" * 9  # top-row cell at precision 9
+    with pytest.raises(ValueError, match="over the limit"):
+        geohash_polygon.expand_geohashes([polar], 1000.0)
+
+
+def test_expand_mapping_polar_runaway_raises():
+    polar = "z" * 9
+    with pytest.raises(ValueError, match="over the limit"):
+        geohash_polygon.expand_geohash_mapping([[polar]], 1000.0)
+
+
+def test_expand_geohashes_large_but_sane_expansion_is_allowed():
+    """The cap must not reject expansions that are merely large."""
+    center = geohash_polygon.encode(-73.5540, 45.5088, 6)
+    result = geohash_polygon.expand_geohashes([center], 50_000.0)
+    assert len(result) > 1000
+
+
+def test_expand_geohashes_reach_is_order_independent():
+    """The hop count is sized on the narrowest cell in the group, not on
+    whichever cell happens to come first, so input order cannot change the
+    result and a high-latitude cell always gets its full reach."""
+    equator = geohash_polygon.encode(10.0, 0.0, 6)
+    arctic = geohash_polygon.encode(10.0, 84.0, 6)
+    forward = set(geohash_polygon.expand_geohashes([equator, arctic], 5000.0))
+    backward = set(geohash_polygon.expand_geohashes([arctic, equator], 5000.0))
+    assert forward == backward
+    # The arctic cell reaches at least as far as it does when expanded alone.
+    alone = set(geohash_polygon.expand_geohashes([arctic], 5000.0))
+    assert alone <= forward
+
+
+def test_expand_geohashes_polar_member_raises_regardless_of_position():
+    """A cell whose expansion would run away must be refused even when it is
+    not the group's first hash."""
+    center = geohash_polygon.encode(-73.5540, 45.5088, 9)
+    polar = "z" * 9
+    for group in ([polar, center], [center, polar]):
+        with pytest.raises(ValueError, match="over the limit"):
+            geohash_polygon.expand_geohashes(group, 1000.0)
+
+
 def test_expand_mapping_invalid_hash_raises():
     with pytest.raises(Exception):
         geohash_polygon.expand_geohash_mapping([["not_a_geohash!"]], 0.10)
