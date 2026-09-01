@@ -120,6 +120,32 @@ def test_expand_mapping_arrow_null_geog_id_raises():
         geohash_polygon.expand_geohash_mapping_arrow(geog_ids, geohash_lists, 100.0)
 
 
+def test_empty_geohash_raises_in_arrow_paths():
+    hashes = pa.array(["f2h30", ""], type=pa.utf8())
+    with pytest.raises(ValueError):
+        geohash_polygon.decode_many_to_wkb_arrow(hashes)
+    with pytest.raises(ValueError):
+        geohash_polygon.decode_many_to_ewkb_arrow(hashes)
+    with pytest.raises(ValueError):
+        geohash_polygon.decode_many_arrow(hashes)
+    with pytest.raises(ValueError):
+        geohash_polygon.decode_many_exactly_arrow(hashes)
+    geog_ids, geohash_lists = _make_arrow_inputs([("g1", [""])])
+    with pytest.raises(ValueError):
+        geohash_polygon.expand_geohash_mapping_arrow(geog_ids, geohash_lists, 100.0)
+
+
+def test_expand_mapping_arrow_null_list_slot_raises():
+    """A null list slot must be refused, not read as an empty group: per the
+    Arrow spec its offsets may span arbitrary values, so treating it as empty
+    relies on a layout the writer is not required to produce."""
+    center = geohash_polygon.encode(-73.5540, 45.5088, 7)
+    geog_ids = pa.array(["g1", "g2"], type=pa.utf8())
+    geohash_lists = pa.array([[center], None], type=pa.list_(pa.utf8()))
+    with pytest.raises(ValueError, match="null at index 1"):
+        geohash_polygon.expand_geohash_mapping_arrow(geog_ids, geohash_lists, 100.0)
+
+
 def test_expand_mapping_arrow_multiple_geohashes_per_group():
     h1 = geohash_polygon.encode(-73.5540, 45.5088, 7)
     h2 = geohash_polygon.encode(-73.5530, 45.5088, 7)
