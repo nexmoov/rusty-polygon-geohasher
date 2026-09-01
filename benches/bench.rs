@@ -47,5 +47,9 @@ fn bench_expand_geohash_set(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_polygons_to_geohashes, bench_expand_geohash_set);
+criterion_group!(
+    benches,
+    bench_polygons_to_geohashes,
+    bench_expand_geohash_set
+);
 criterion_main!(benches);
