@@ -2,9 +2,10 @@ use geo::{BoundingRect, Intersects, Polygon, PreparedGeometry, Rect, Relate};
 
 use arrow_array::builder::LargeStringBuilder;
 use arrow_array::{
-    Array, ArrayRef, LargeBinaryArray, LargeStringArray, ListArray, RecordBatch, StringArray,
+    Array, ArrayRef, Float64Array, LargeBinaryArray, LargeStringArray, ListArray, RecordBatch,
+    StringArray,
 };
-use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer};
+use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema};
 use geohash::{decode_bbox, encode, GeohashError};
 use pyo3::prelude::*;
@@ -735,6 +736,227 @@ fn decode_many_to_wkb_arrow_impl(
     Ok(pyo3_arrow::PyArray::from_array_ref(Arc::new(column)))
 }
 
+/// Borrow a `Float64` Arrow array, rejecting anything else.
+fn float_column<'a>(array: &'a dyn Array, argument: &str) -> PyResult<&'a Float64Array> {
+    array
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "{argument} must be a Float64 Array, got {}",
+                array.data_type()
+            ))
+        })
+}
+
+/// Encode paired coordinate columns into a `LargeUtf8` column of geohashes.
+///
+/// Every hash is exactly `precision` characters, so the values buffer is sized
+/// and filled the same way as the WKB column. A row is null if either
+/// coordinate is null.
+fn coords_to_geohash_column(
+    lngs: &Float64Array,
+    lats: &Float64Array,
+    precision: usize,
+) -> Result<LargeStringArray, GeohashError> {
+    let rows = lngs.len();
+    let mut values = vec![b'0'; rows * precision];
+    let nulls = NullBuffer::union(lngs.nulls(), lats.nulls());
+
+    values
+        .par_chunks_exact_mut(precision)
+        .enumerate()
+        .try_for_each(|(i, slot)| -> Result<(), GeohashError> {
+            if lngs.is_null(i) || lats.is_null(i) {
+                return Ok(());
+            }
+            let hash = encode((lngs.value(i), lats.value(i)).into(), precision)?;
+            slot.copy_from_slice(hash.as_bytes());
+            Ok(())
+        })?;
+
+    let offsets = OffsetBuffer::from_lengths(std::iter::repeat_n(precision, rows));
+    // Every byte written is ASCII: base32 for real rows, '0' padding for nulls.
+    Ok(LargeStringArray::new(
+        offsets,
+        Buffer::from_vec(values),
+        nulls,
+    ))
+}
+
+/// Encode coordinate Arrays to a `LargeUtf8` Array of geohashes.
+///
+/// The Arrow twin of `encode_many`. Accepts two `Float64` PyArrow `Array`s of
+/// equal length; a row is null if either coordinate is null.
+#[pyfunction]
+#[pyo3(signature = (lngs, lats, precision, num_threads=None))]
+fn encode_many_arrow(
+    py: Python<'_>,
+    lngs: pyo3_arrow::PyArray,
+    lats: pyo3_arrow::PyArray,
+    precision: usize,
+    num_threads: Option<usize>,
+) -> PyResult<pyo3_arrow::PyArray> {
+    if !(1..=ghbits::MAX_PRECISION).contains(&precision) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "precision must be between 1 and {}, got {precision}",
+            ghbits::MAX_PRECISION
+        )));
+    }
+    let pool = make_pool(num_threads)?;
+    let (lng_array, _) = lngs.into_inner();
+    let (lat_array, _) = lats.into_inner();
+    let lngs = float_column(lng_array.as_ref(), "lngs")?;
+    let lats = float_column(lat_array.as_ref(), "lats")?;
+    if lngs.len() != lats.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "lngs and lats must have the same length, got {} and {}",
+            lngs.len(),
+            lats.len()
+        )));
+    }
+
+    let column = py
+        .detach(|| run_with_pool(&pool, || coords_to_geohash_column(lngs, lats, precision)))
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+    Ok(pyo3_arrow::PyArray::from_array_ref(Arc::new(column)))
+}
+
+/// Decode a geohash column into centre coordinates, and optionally the half-extents.
+///
+/// `with_errors` mirrors the split between `decode_many` and
+/// `decode_many_exactly`: the error columns are only built when asked for.
+fn geohashes_to_coord_columns(
+    hashes: &StringColumn<'_>,
+    with_errors: bool,
+) -> Result<Vec<Float64Array>, GeohashError> {
+    let rows = hashes.len();
+    let columns = if with_errors { 4 } else { 2 };
+    let nulls = hashes.nulls();
+    if rows == 0 {
+        return Ok((0..columns)
+            .map(|_| Float64Array::new(Vec::new().into(), nulls.clone()))
+            .collect());
+    }
+
+    // One allocation for the whole result, laid out column-major so each output
+    // column is already a contiguous run and can be handed to Arrow as a slice
+    // of this buffer. A row-major fill would need a second pass to gather each
+    // column out, doubling both the peak memory and the write traffic.
+    let mut cells = vec![0.0f64; rows * columns];
+
+    // Threads split the rows, so each needs the same row window out of every
+    // column. Cut each column into windows up front and regroup them by window,
+    // which hands every thread a disjoint set of slices.
+    const ROWS_PER_TASK: usize = 4096;
+    let tasks = rows.div_ceil(ROWS_PER_TASK);
+    let mut windows: Vec<Vec<&mut [f64]>> =
+        (0..tasks).map(|_| Vec::with_capacity(columns)).collect();
+    let mut rest = cells.as_mut_slice();
+    for _ in 0..columns {
+        let (column, tail) = rest.split_at_mut(rows);
+        rest = tail;
+        for (task, window) in column.chunks_mut(ROWS_PER_TASK).enumerate() {
+            windows[task].push(window);
+        }
+    }
+
+    windows.into_par_iter().enumerate().try_for_each(
+        |(task, mut cols)| -> Result<(), GeohashError> {
+            let base = task * ROWS_PER_TASK;
+            for r in 0..cols[0].len() {
+                let i = base + r;
+                if hashes.is_null(i) {
+                    continue;
+                }
+                let bbox = decode_bbox(hashes.value(i))?;
+                cols[0][r] = (bbox.min().x + bbox.max().x) / 2.0;
+                cols[1][r] = (bbox.min().y + bbox.max().y) / 2.0;
+                if with_errors {
+                    cols[2][r] = (bbox.max().x - bbox.min().x) / 2.0;
+                    cols[3][r] = (bbox.max().y - bbox.min().y) / 2.0;
+                }
+            }
+            Ok(())
+        },
+    )?;
+
+    // Each column is a window onto the one buffer, so this shares it rather
+    // than copying.
+    let buffer = Buffer::from_vec(cells);
+    Ok((0..columns)
+        .map(|c| {
+            let values = ScalarBuffer::<f64>::new(buffer.clone(), c * rows, rows);
+            Float64Array::new(values, nulls.clone())
+        })
+        .collect())
+}
+
+/// Shared body of `decode_many_arrow` and `decode_many_exactly_arrow`.
+fn decode_many_arrow_impl(
+    py: Python<'_>,
+    geohashes: pyo3_arrow::PyArray,
+    with_errors: bool,
+    num_threads: Option<usize>,
+) -> PyResult<pyo3_arrow::PyRecordBatch> {
+    let pool = make_pool(num_threads)?;
+    let (array, _) = geohashes.into_inner();
+    let hashes = StringColumn::new(array.as_ref(), "geohashes")?;
+
+    let columns = py
+        .detach(|| run_with_pool(&pool, || geohashes_to_coord_columns(&hashes, with_errors)))
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+    let names: &[&str] = if with_errors {
+        &["lng", "lat", "lng_err", "lat_err"]
+    } else {
+        &["lng", "lat"]
+    };
+    let schema = Arc::new(Schema::new(
+        names
+            .iter()
+            .map(|name| Field::new(*name, DataType::Float64, true))
+            .collect::<Vec<_>>(),
+    ));
+    let arrays: Vec<ArrayRef> = columns
+        .into_iter()
+        .map(|c| Arc::new(c) as ArrayRef)
+        .collect();
+
+    let batch = RecordBatch::try_new(schema, arrays)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(pyo3_arrow::PyRecordBatch::new(batch))
+}
+
+/// Decode a geohash Array to cell-centre coordinates, via Arrow.
+///
+/// The Arrow twin of `decode_many`. Returns a `RecordBatch` with schema
+/// `(lng: Float64, lat: Float64)`; null inputs produce null outputs.
+#[pyfunction]
+#[pyo3(signature = (geohashes, num_threads=None))]
+fn decode_many_arrow(
+    py: Python<'_>,
+    geohashes: pyo3_arrow::PyArray,
+    num_threads: Option<usize>,
+) -> PyResult<pyo3_arrow::PyRecordBatch> {
+    decode_many_arrow_impl(py, geohashes, false, num_threads)
+}
+
+/// Decode a geohash Array to centres and half-extents, via Arrow.
+///
+/// The Arrow twin of `decode_many_exactly`. Returns a `RecordBatch` with schema
+/// `(lng, lat, lng_err, lat_err)`, all `Float64`.
+#[pyfunction]
+#[pyo3(signature = (geohashes, num_threads=None))]
+fn decode_many_exactly_arrow(
+    py: Python<'_>,
+    geohashes: pyo3_arrow::PyArray,
+    num_threads: Option<usize>,
+) -> PyResult<pyo3_arrow::PyRecordBatch> {
+    decode_many_arrow_impl(py, geohashes, true, num_threads)
+}
+
 /// Decode a geohash Array to a `LargeBinary` Array of WKB polygon bounding boxes.
 ///
 /// The Arrow twin of `decode_many_to_wkb`. Strings are read straight from the
@@ -1220,6 +1442,9 @@ fn geohash_polygon(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode_many_to_ewkb, m)?)?;
     m.add_function(wrap_pyfunction!(decode_many_to_wkb_arrow, m)?)?;
     m.add_function(wrap_pyfunction!(decode_many_to_ewkb_arrow, m)?)?;
+    m.add_function(wrap_pyfunction!(encode_many_arrow, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_many_arrow, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_many_exactly_arrow, m)?)?;
     m.add_function(wrap_pyfunction!(expand_geohashes, m)?)?;
     m.add_function(wrap_pyfunction!(expand_geohash_mapping, m)?)?;
     m.add_function(wrap_pyfunction!(expand_geohash_mapping_arrow, m)?)?;
@@ -2169,5 +2394,125 @@ mod tests {
         let (xmin, ymin, _, _) = parse_polygon_bbox(column.value(0), None);
         assert_eq!(xmin, expected.min().x);
         assert_eq!(ymin, expected.min().y);
+    }
+
+    // ── Arrow coordinate columns ─────────────────────────────────────────────
+
+    #[test]
+    fn test_coord_columns_match_the_list_api() {
+        let hashes = ["dr5ru7", "dpz8zzzz", "9q8yy9ve"];
+        let array = StringArray::from(hashes.to_vec());
+        let columns = geohashes_to_coord_columns(&StringColumn::Utf8(&array), true).unwrap();
+        assert_eq!(columns.len(), 4);
+
+        for (i, hash) in hashes.iter().enumerate() {
+            let bbox = decode_bbox(hash).unwrap();
+            assert_eq!(columns[0].value(i), (bbox.min().x + bbox.max().x) / 2.0);
+            assert_eq!(columns[1].value(i), (bbox.min().y + bbox.max().y) / 2.0);
+            assert_eq!(columns[2].value(i), (bbox.max().x - bbox.min().x) / 2.0);
+            assert_eq!(columns[3].value(i), (bbox.max().y - bbox.min().y) / 2.0);
+        }
+    }
+
+    #[test]
+    fn test_coord_columns_without_errors_has_two_columns() {
+        let array = StringArray::from(vec!["dr5ru7"]);
+        let columns = geohashes_to_coord_columns(&StringColumn::Utf8(&array), false).unwrap();
+        assert_eq!(columns.len(), 2);
+    }
+
+    #[test]
+    fn test_coord_columns_preserve_nulls() {
+        let array = StringArray::from(vec![Some("dr5ru7"), None, Some("f2h30")]);
+        let columns = geohashes_to_coord_columns(&StringColumn::Utf8(&array), true).unwrap();
+        for column in &columns {
+            assert_eq!(column.null_count(), 1);
+            assert!(column.is_null(1));
+        }
+        let bbox = decode_bbox("f2h30").unwrap();
+        assert_eq!(columns[0].value(2), (bbox.min().x + bbox.max().x) / 2.0);
+    }
+
+    #[test]
+    fn test_coord_columns_reject_invalid_geohash() {
+        let array = StringArray::from(vec!["not-a-geohash!"]);
+        assert!(geohashes_to_coord_columns(&StringColumn::Utf8(&array), false).is_err());
+    }
+
+    // ── Arrow geohash column ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_geohash_column_matches_the_crate() {
+        let lngs = Float64Array::from(vec![-76.6, -80.8501, -73.5540]);
+        let lats = Float64Array::from(vec![47.1, 35.204, 45.5088]);
+        let column = coords_to_geohash_column(&lngs, &lats, 7).unwrap();
+        for i in 0..3 {
+            let want = encode((lngs.value(i), lats.value(i)).into(), 7).unwrap();
+            assert_eq!(column.value(i), want);
+        }
+    }
+
+    #[test]
+    fn test_geohash_column_rows_have_the_requested_precision() {
+        let lngs = Float64Array::from(vec![-73.5540, 12.0]);
+        let lats = Float64Array::from(vec![45.5088, -8.0]);
+        for precision in 1..=ghbits::MAX_PRECISION {
+            let column = coords_to_geohash_column(&lngs, &lats, precision).unwrap();
+            for i in 0..column.len() {
+                assert_eq!(column.value(i).len(), precision);
+            }
+        }
+    }
+
+    /// A null in either coordinate makes the row null, and must not corrupt the
+    /// rows around it — the padding written into a null slot still has to be
+    /// valid UTF-8 for the buffer to be a legal string array.
+    #[test]
+    fn test_geohash_column_nulls_in_either_coordinate() {
+        let lngs = Float64Array::from(vec![Some(-73.5540), None, Some(1.0), Some(2.0)]);
+        let lats = Float64Array::from(vec![Some(45.5088), Some(1.0), None, Some(3.0)]);
+        let column = coords_to_geohash_column(&lngs, &lats, 6).unwrap();
+        assert_eq!(column.null_count(), 2);
+        assert!(column.is_null(1) && column.is_null(2));
+        assert_eq!(
+            column.value(0),
+            encode((-73.5540, 45.5088).into(), 6).unwrap()
+        );
+        assert_eq!(column.value(3), encode((2.0, 3.0).into(), 6).unwrap());
+    }
+
+    #[test]
+    fn test_geohash_column_empty() {
+        let empty = Float64Array::from(Vec::<f64>::new());
+        let column = coords_to_geohash_column(&empty, &empty, 7).unwrap();
+        assert_eq!(column.len(), 0);
+    }
+
+    #[test]
+    fn test_geohash_column_rejects_out_of_range_coordinates() {
+        let lngs = Float64Array::from(vec![0.0]);
+        let lats = Float64Array::from(vec![120.0]); // beyond the poles
+        assert!(coords_to_geohash_column(&lngs, &lats, 7).is_err());
+    }
+
+    /// Encoding then decoding must land back inside the original cell.
+    #[test]
+    fn test_arrow_encode_decode_round_trip() {
+        let lngs = Float64Array::from(vec![-73.5540, 12.3456, -179.9, 179.9]);
+        let lats = Float64Array::from(vec![45.5088, -8.7654, -89.9, 89.9]);
+        let encoded = coords_to_geohash_column(&lngs, &lats, 9).unwrap();
+        let decoded = geohashes_to_coord_columns(&StringColumn::LargeUtf8(&encoded), true).unwrap();
+        for i in 0..lngs.len() {
+            assert!(
+                (decoded[0].value(i) - lngs.value(i)).abs() <= decoded[2].value(i),
+                "lng {} outside cell at row {i}",
+                lngs.value(i)
+            );
+            assert!(
+                (decoded[1].value(i) - lats.value(i)).abs() <= decoded[3].value(i),
+                "lat {} outside cell at row {i}",
+                lats.value(i)
+            );
+        }
     }
 }
