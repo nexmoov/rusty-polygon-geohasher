@@ -131,3 +131,11 @@ def test_expand_mapping_arrow_multiple_geohashes_per_group():
     assert h1 in result_hashes
     assert h2 in result_hashes
     assert len(result_hashes) > 2
+
+
+def test_arrow_null_geohash_reports_the_null():
+    """A null inside a list used to surface as a precision mismatch."""
+    geog_ids = pa.array(["a", "b"], type=pa.string())
+    lists = pa.array([["f2h30", None], ["f2h31"]], type=pa.list_(pa.string()))
+    with pytest.raises(ValueError, match=r"contains a null at position 1"):
+        geohash_polygon.expand_geohash_mapping_arrow(geog_ids, lists, 100.0)
