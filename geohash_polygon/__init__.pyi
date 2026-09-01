@@ -114,12 +114,17 @@ def expand_geohash_mapping_arrow(
     geog_ids: Any,
     geohash_lists: Any,
     expansion_m: float,
+    dictionary_geog_id: bool = False,
 ) -> Any:
     """Expand geohash groups using Arrow arrays for zero-copy I/O.
 
     geog_ids: pyarrow Utf8 Array (single chunk — call .combine_chunks() first)
     geohash_lists: pyarrow List<Utf8> Array (single chunk)
-    Returns a RecordBatch with schema (geog_id: LargeUtf8, geohash: LargeUtf8).
+    dictionary_geog_id: emit geog_id as Dictionary<Int32, Utf8> rather than
+        repeating each id once per row.
+    Returns a RecordBatch with schema (geog_id, geohash: LargeUtf8), where
+    geog_id is LargeUtf8 by default or Dictionary<Int32, Utf8> when
+    dictionary_geog_id is set.
     Convert to pyarrow via pa.record_batch(result).
     """
     ...
