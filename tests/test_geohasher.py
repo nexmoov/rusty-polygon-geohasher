@@ -257,15 +257,20 @@ def test_hole(level, inner, polygon_hole):
     reason="two CPU-bound threads cannot overlap on a single core, GIL or not",
 )
 def test_polygon_to_geohashes_releases_the_gil(polygon_verdun):
-    """The cover walk must not hold the GIL.
+    """Two concurrent calls should overlap rather than serialise.
 
-    Two concurrent calls should overlap rather than serialise. If the GIL were
-    held for the whole walk, the pair would take about twice a single call.
+    Pinned to precision 8, which stays below PARALLEL_COVER_MIN_CELLS and so
+    covers the polygon on a single thread. That matters: above the threshold one
+    call already saturates every core, and two of them take twice as long whether
+    the GIL is released or not, so a finer precision cannot tell the two apart.
+
+    Measured on this fixture over ten repeats: a held GIL gives 1.97-2.21x and a
+    released one 1.16-1.26x, so the 1.7x threshold below sits clear of both.
     """
     import threading
     import time
 
-    precision = 9
+    precision = 8
     # One call is short enough that thread start-up and scheduler noise move the
     # ratio by more than the effect being measured. Repeating inside each timing
     # makes the walk itself dominate.
