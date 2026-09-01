@@ -345,3 +345,101 @@ def test_arrow_encode_decode_round_trip():
     for i, (lng, lat) in enumerate(zip(LNGS, LATS)):
         assert abs(batch["lng"][i].as_py() - lng) <= batch["lng_err"][i].as_py()
         assert abs(batch["lat"][i].as_py() - lat) <= batch["lat_err"][i].as_py()
+
+
+# ── expand_geohash_mapping_arrow: dictionary geog_id ─────────────────────────
+
+
+def _mapping(record_batch):
+    """(geog_id -> set of geohashes), independent of row order and geog_id encoding."""
+    import collections
+
+    column = record_batch.column(0)
+    if pa.types.is_dictionary(column.type):
+        column = column.cast(pa.large_string())
+    out = collections.defaultdict(set)
+    for geog_id, geohash in zip(column.to_pylist(), record_batch.column(1).to_pylist()):
+        out[geog_id].add(geohash)
+    return dict(out)
+
+
+def test_dictionary_geog_id_carries_the_same_pairing():
+    geog_ids, geohash_lists = _make_arrow_inputs([("a", ["f2h30"]), ("b", ["f2h31", "f2h32"])])
+    plain = pa.record_batch(
+        geohash_polygon.expand_geohash_mapping_arrow(geog_ids, geohash_lists, 100.0)
+    )
+    encoded = pa.record_batch(
+        geohash_polygon.expand_geohash_mapping_arrow(geog_ids, geohash_lists, 100.0, True)
+    )
+    assert _mapping(plain) == _mapping(encoded)
+    assert plain.num_rows == encoded.num_rows
+
+
+def test_dictionary_geog_id_types():
+    geog_ids, geohash_lists = _make_arrow_inputs([("a", ["f2h30"])])
+    encoded = pa.record_batch(
+        geohash_polygon.expand_geohash_mapping_arrow(geog_ids, geohash_lists, 100.0, True)
+    )
+    assert pa.types.is_dictionary(encoded.schema.field("geog_id").type)
+    assert encoded.schema.field("geog_id").type.index_type == pa.int32()
+    assert encoded.schema.field("geog_id").type.value_type == pa.string()
+    assert encoded.schema.field("geohash").type == pa.large_string()
+
+
+def test_dictionary_geog_id_deduplicates_repeated_ids():
+    """The dictionary must hold one copy of each *distinct* id: pandas refuses
+    a categorical whose categories repeat, so duplicate input ids would make
+    to_pandas() blow up on an otherwise valid batch."""
+    geog_ids, geohash_lists = _make_arrow_inputs(
+        [("a", ["f2h30"]), ("b", ["f2h31"]), ("a", ["f2h32"])]
+    )
+    plain = pa.record_batch(
+        geohash_polygon.expand_geohash_mapping_arrow(geog_ids, geohash_lists, 100.0)
+    )
+    encoded = pa.record_batch(
+        geohash_polygon.expand_geohash_mapping_arrow(geog_ids, geohash_lists, 100.0, True)
+    )
+    dictionary = encoded.column(0).dictionary.to_pylist()
+    assert dictionary == ["a", "b"], "one entry per distinct id, first-seen order"
+    assert _mapping(plain) == _mapping(encoded)
+    assert plain.num_rows == encoded.num_rows
+    encoded.to_pandas()  # must not raise
+
+
+def test_plain_geog_id_remains_the_default():
+    geog_ids, geohash_lists = _make_arrow_inputs([("a", ["f2h30"])])
+    default = pa.record_batch(
+        geohash_polygon.expand_geohash_mapping_arrow(geog_ids, geohash_lists, 100.0)
+    )
+    assert default.schema.field("geog_id").type == pa.large_string()
+
+
+def test_dictionary_geog_id_is_smaller():
+    """The whole point: one copy of each id instead of one per row."""
+    groups = [(f"geography-with-a-longish-id-{i:04d}", ["f2h30", "f2h31"]) for i in range(200)]
+    geog_ids, geohash_lists = _make_arrow_inputs(groups)
+    plain = pa.record_batch(
+        geohash_polygon.expand_geohash_mapping_arrow(geog_ids, geohash_lists, 200.0)
+    )
+    encoded = pa.record_batch(
+        geohash_polygon.expand_geohash_mapping_arrow(geog_ids, geohash_lists, 200.0, True)
+    )
+    assert encoded.column(0).nbytes < plain.column(0).nbytes / 2
+
+
+def test_dictionary_geog_id_with_an_empty_group():
+    geog_ids, geohash_lists = _make_arrow_inputs([("a", ["f2h30"]), ("empty", []), ("b", ["f2h31"])])
+    encoded = pa.record_batch(
+        geohash_polygon.expand_geohash_mapping_arrow(geog_ids, geohash_lists, 100.0, True)
+    )
+    mapping = _mapping(encoded)
+    assert "empty" not in mapping
+    assert set(mapping) == {"a", "b"}
+
+
+def test_dictionary_geog_id_empty_input():
+    geog_ids, geohash_lists = _make_arrow_inputs([])
+    encoded = pa.record_batch(
+        geohash_polygon.expand_geohash_mapping_arrow(geog_ids, geohash_lists, 100.0, True)
+    )
+    assert encoded.num_rows == 0

@@ -1,9 +1,10 @@
 use geo::{BoundingRect, Intersects, Polygon, PreparedGeometry, Rect, Relate};
 
 use arrow_array::builder::LargeStringBuilder;
+use arrow_array::types::Int32Type;
 use arrow_array::{
-    Array, ArrayRef, Float64Array, LargeBinaryArray, LargeStringArray, ListArray, RecordBatch,
-    StringArray,
+    Array, ArrayRef, DictionaryArray, Float64Array, Int32Array, LargeBinaryArray, LargeStringArray,
+    ListArray, RecordBatch, StringArray,
 };
 use arrow_buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Schema};
@@ -12,7 +13,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyAny;
 use pyo3::wrap_pyfunction;
 use rayon::prelude::*;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -1289,15 +1290,22 @@ fn expand_geohash_mapping(
 /// Returns a flat PyArrow `RecordBatch` with schema `(geog_id: LargeUtf8, geohash: LargeUtf8)` —
 /// one row per (geog_id, expanded_geohash) pair, with geog_ids repeated as needed.
 ///
+/// Pass `dictionary_geog_id=True` to emit `geog_id` as `Dictionary<Int32, Utf8>`
+/// instead. Every row of a group repeats that group's id, so the plain column is
+/// almost entirely duplicate bytes; the dictionary holds one copy of each id and
+/// the column becomes 4 bytes per row.
+///
 /// Compared to `expand_geohash_mapping`, this function eliminates the Python str object
 /// round-trip: strings are read directly from Arrow buffers and the output is built into
 /// Arrow buffers without touching the Python heap at all.
 #[pyfunction]
+#[pyo3(signature = (geog_ids, geohash_lists, expansion_m, dictionary_geog_id=false))]
 fn expand_geohash_mapping_arrow(
     py: Python<'_>,
     geog_ids: pyo3_arrow::PyArray,
     geohash_lists: pyo3_arrow::PyArray,
     expansion_m: f64,
+    dictionary_geog_id: bool,
 ) -> PyResult<pyo3_arrow::PyRecordBatch> {
     if !expansion_m.is_finite() || expansion_m < 0.0 {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -1369,58 +1377,102 @@ fn expand_geohash_mapping_arrow(
     // Clone strings from Arrow buffers into owned Strings. Reading from Arrow's UTF-8
     // buffer is ~5× faster than going through to_pylist() + PyO3 str conversion, since
     // it skips the CPython object layer entirely.
-    let groups: Vec<(String, Vec<String>, usize)> = (0..n)
+    let geog_ids: Vec<String> = (0..n).map(|i| geog_id_arr.value(i).to_owned()).collect();
+    let groups: Vec<(Vec<String>, usize)> = (0..n)
         .map(|i| {
-            let geog_id = geog_id_arr.value(i).to_owned();
             let start = offsets[i] as usize;
             let end = offsets[i + 1] as usize;
             let hashes: Vec<String> = (start..end)
                 .map(|j| values_arr.value(j).to_owned())
                 .collect();
-            (geog_id, hashes, n_hops_per_group[i])
+            (hashes, n_hops_per_group[i])
         })
         .collect();
 
-    // Release the GIL and expand all groups in parallel via Rayon.
-    let results: Vec<(String, Result<HashSet<String>, GeohashError>)> = py.detach(|| {
+    // Release the GIL and expand all groups in parallel via Rayon. Order is preserved,
+    // so results[i] still belongs to geog_ids[i].
+    let results: Vec<Result<HashSet<String>, GeohashError>> = py.detach(|| {
         groups
             .into_par_iter()
-            .map(|(geog_id, hashes, n_hops)| {
+            .map(|(hashes, n_hops)| {
                 let hash_set: HashSet<String> = hashes.into_iter().collect();
-                (geog_id, expand_geohash_set(&hash_set, n_hops))
+                expand_geohash_set(&hash_set, n_hops)
             })
             .collect()
     });
 
+    let expanded: Vec<HashSet<String>> = results
+        .into_iter()
+        .map(|r| r.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string())))
+        .collect::<PyResult<_>>()?;
+
     // Count output rows so we can pre-allocate Arrow builders exactly once.
-    let total_out: usize = results
-        .iter()
-        .map(|(_, r)| r.as_ref().map_or(0, |s| s.len()))
-        .sum();
+    let total_out: usize = expanded.iter().map(|s| s.len()).sum();
 
     // Build flat Arrow output directly in Rust — no Python str objects, no flatten loop,
     // no pa.array() round-trip.
-    let mut out_geog_ids = LargeStringBuilder::with_capacity(total_out, total_out * 20);
     let mut out_geohashes = LargeStringBuilder::with_capacity(total_out, total_out * 7);
-
-    for (geog_id, expanded) in results {
-        let expanded =
-            expanded.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        for geohash in expanded {
-            out_geog_ids.append_value(&geog_id);
-            out_geohashes.append_value(&geohash);
+    for group in &expanded {
+        for geohash in group {
+            out_geohashes.append_value(geohash);
         }
     }
 
+    let (geog_id_column, geog_id_type) = if dictionary_geog_id {
+        // Every row of a group repeats that group's geog_id, so the plain column is
+        // mostly duplicate bytes. Emit the indices instead and let the dictionary
+        // hold one copy of each *distinct* id: the same id may appear in several
+        // input rows, and consumers like pandas refuse a categorical whose
+        // categories repeat.
+        let mut key_of: FxHashMap<&str, usize> = FxHashMap::default();
+        let mut distinct: Vec<&str> = Vec::new();
+        let group_keys: Vec<usize> = geog_ids
+            .iter()
+            .map(|id| {
+                *key_of.entry(id.as_str()).or_insert_with(|| {
+                    distinct.push(id.as_str());
+                    distinct.len() - 1
+                })
+            })
+            .collect();
+
+        // The schema pins the key type to Int32, so an id index past i32::MAX
+        // would wrap to a negative key and silently repoint rows at the wrong
+        // geog_id. Refuse rather than mispair.
+        if distinct.len() > i32::MAX as usize {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "cannot dictionary-encode {} distinct geog_ids: the Int32 dictionary \
+                 key holds at most {}. Pass dictionary_geog_id=False, or split the input.",
+                distinct.len(),
+                i32::MAX
+            )));
+        }
+        let mut keys: Vec<i32> = Vec::with_capacity(total_out);
+        for (key, group) in group_keys.iter().zip(&expanded) {
+            keys.extend(std::iter::repeat_n(*key as i32, group.len()));
+        }
+        let values = StringArray::from(distinct);
+        let data_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let dictionary =
+            DictionaryArray::<Int32Type>::try_new(Int32Array::from(keys), Arc::new(values))
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        (Arc::new(dictionary) as ArrayRef, data_type)
+    } else {
+        let mut builder = LargeStringBuilder::with_capacity(total_out, total_out * 20);
+        for (geog_id, group) in geog_ids.iter().zip(&expanded) {
+            for _ in 0..group.len() {
+                builder.append_value(geog_id);
+            }
+        }
+        (Arc::new(builder.finish()) as ArrayRef, DataType::LargeUtf8)
+    };
+
     let schema = Arc::new(Schema::new(vec![
-        Field::new("geog_id", DataType::LargeUtf8, false),
+        Field::new("geog_id", geog_id_type, false),
         Field::new("geohash", DataType::LargeUtf8, false),
     ]));
 
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(out_geog_ids.finish()),
-        Arc::new(out_geohashes.finish()),
-    ];
+    let columns: Vec<ArrayRef> = vec![geog_id_column, Arc::new(out_geohashes.finish())];
 
     let batch = RecordBatch::try_new(schema, columns)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
