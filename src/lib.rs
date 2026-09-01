@@ -785,25 +785,81 @@ fn decode_many_to_ewkb(
 
 // ── Geography expansion ───────────────────────────────────────────────────────
 
-fn n_hops_for(sample_hash: &str, expansion_m: f64) -> PyResult<usize> {
+/// Upper bound on the hop count `n_hops_for` will return.
+///
+/// Each hop grows the frontier by a ring, so a blob expanded by `n` hops gains
+/// on the order of `n^2` cells. Ten thousand hops is already far past anything
+/// a real expansion needs, and well short of the counts a degenerate input can
+/// produce, so it separates "expensive" from "will never finish".
+const MAX_EXPANSION_HOPS: usize = 10_000;
+
+/// Hops needed to cover `expansion_m` metres, given a sample cell's dimensions.
+///
+/// Uses the smaller of the cell's height and width so the expansion reaches at
+/// least `expansion_m` in every direction. Cell width shrinks with
+/// `cos(latitude)`, so the hop count climbs steeply toward the poles: at
+/// precision 9, expanding 1 km needs 419 hops at latitude 60 but 1,206 at
+/// latitude 80 and around 1.5e8 at the top row. Without the cap below, a polar
+/// input would build a frontier of billions of cells and never return.
+fn n_hops_for_core(sample_hash: &str, expansion_m: f64) -> Result<usize, String> {
     if !expansion_m.is_finite() || expansion_m < 0.0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "expansion_m must be a finite non-negative number",
-        ));
+        return Err("expansion_m must be a finite non-negative number".to_string());
     }
-    let bbox = decode_bbox(sample_hash)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid geohash: {e}")))?;
+    let bbox = decode_bbox(sample_hash).map_err(|e| format!("invalid geohash: {e}"))?;
     let lat_center = (bbox.min().y + bbox.max().y) / 2.0;
     let cell_height_m = (bbox.max().y - bbox.min().y) * 111_000.0;
     let cell_width_m = (bbox.max().x - bbox.min().x) * 111_320.0 * lat_center.to_radians().cos();
     let min_cell_m = cell_height_m.min(cell_width_m);
-    Ok((expansion_m / min_cell_m).ceil() as usize)
+
+    if !min_cell_m.is_finite() || min_cell_m <= 0.0 {
+        return Err(format!(
+            "cannot size an expansion against geohash {sample_hash:?}: its cell has no \
+             usable extent (width {cell_width_m} m, height {cell_height_m} m)"
+        ));
+    }
+
+    let hops = (expansion_m / min_cell_m).ceil();
+    if hops > MAX_EXPANSION_HOPS as f64 {
+        return Err(format!(
+            "expanding by {expansion_m} m from geohash {sample_hash:?} needs {hops:.0} hops, \
+             over the limit of {MAX_EXPANSION_HOPS}. The cell is only {min_cell_m:.3} m across \
+             at its narrowest — use a coarser precision, or a smaller expansion_m."
+        ));
+    }
+    Ok(hops as usize)
+}
+
+/// Hop count for a whole group: the largest count any of its cells needs.
+///
+/// Cell width shrinks with `cos(latitude)`, so a count sized on one sampled
+/// cell under-reaches every cell closer to a pole than the sample — and which
+/// cell got sampled depended on input order. Sizing on the narrowest cell in
+/// the group keeps the "at least `expansion_m` in every direction" promise for
+/// every member; the wider cells merely reach a little further.
+fn n_hops_for_group_core<'a, I>(hashes: I, expansion_m: f64) -> Result<usize, String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut hops = 0;
+    for hash in hashes {
+        hops = hops.max(n_hops_for_core(hash, expansion_m)?);
+    }
+    Ok(hops)
+}
+
+/// [`n_hops_for_group_core`] with its failure surfaced as a Python `ValueError`.
+fn n_hops_for_group<'a, I>(hashes: I, expansion_m: f64) -> PyResult<usize>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    n_hops_for_group_core(hashes, expansion_m).map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
 /// Expand a single group of geohashes outward by `expansion_m` metres.
 ///
-/// The hop count is derived from the cell height of a sample hash, so it works
-/// for any precision level.
+/// The hop count is sized on the narrowest cell in the group, so the expansion
+/// reaches at least `expansion_m` in every direction from every cell at any
+/// precision level.
 #[pyfunction]
 fn expand_geohashes(py: Python<'_>, geohashes: Vec<String>, expansion_m: f64) -> PyResult<Vec<String>> {
     if geohashes.is_empty() {
@@ -815,7 +871,7 @@ fn expand_geohashes(py: Python<'_>, geohashes: Vec<String>, expansion_m: f64) ->
             "all geohashes must have the same precision",
         ));
     }
-    let n_hops = n_hops_for(geohashes.first().unwrap(), expansion_m)?;
+    let n_hops = n_hops_for_group(geohashes.iter().map(String::as_str), expansion_m)?;
     let hash_set: HashSet<String> = geohashes.into_iter().collect();
     py.detach(|| expand_geohash_set(&hash_set, n_hops))
         .map(|s| s.into_iter().collect())
@@ -828,8 +884,8 @@ fn expand_geohashes(py: Python<'_>, geohashes: Vec<String>, expansion_m: f64) ->
 /// `result[i]` is the expanded version of `groups[i]`. Groups are processed in
 /// parallel across geographies via Rayon.
 ///
-/// The hop count is derived per group from the cell height of the group's first
-/// hash, so groups at different precision levels are each handled correctly.
+/// The hop count is sized per group on its narrowest cell, so groups at
+/// different precision levels or latitudes are each handled correctly.
 #[pyfunction]
 fn expand_geohash_mapping(
     py: Python<'_>,
@@ -850,7 +906,7 @@ fn expand_geohash_mapping(
                         "all geohashes in a group must have the same precision",
                     ));
                 }
-                n_hops_for(h, expansion_m)
+                n_hops_for_group(g.iter().map(String::as_str), expansion_m)
             }
             None => Ok(0),
         })
@@ -948,7 +1004,7 @@ fn expand_geohash_mapping_arrow(
                     "all geohashes in a group must have the same precision",
                 ));
             }
-            n_hops_for(first, expansion_m)
+            n_hops_for_group((start..end).map(|j| values_arr.value(j)), expansion_m)
         })
         .collect::<PyResult<_>>()?;
 
@@ -1751,5 +1807,81 @@ mod tests {
                 "{hash} jumped away from the north pole"
             );
         }
+    }
+
+    // ── n_hops_for ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_n_hops_for_typical_cases() {
+        // A p6 cell is roughly 1.2 km x 0.6 km, so 600 m is about one hop.
+        assert_eq!(n_hops_for_core("f2h30f", 0.0).unwrap(), 0);
+        assert!((1..=3).contains(&n_hops_for_core("f2h30f", 600.0).unwrap()));
+        // Finer cells need proportionally more hops.
+        assert!(
+            n_hops_for_core("f2h30fg", 600.0).unwrap() > n_hops_for_core("f2h30f", 600.0).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_n_hops_for_rejects_bad_expansion() {
+        for bad in [f64::NAN, f64::INFINITY, -1.0] {
+            assert!(
+                n_hops_for_core("f2h30f", bad).is_err(),
+                "{bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_n_hops_for_rejects_invalid_geohash() {
+        assert!(n_hops_for_core("not-a-geohash!", 100.0).is_err());
+    }
+
+    /// Near the poles a cell's width collapses with cos(latitude), so the hop
+    /// count explodes. It must be refused rather than left to build a frontier
+    /// of billions of cells.
+    #[test]
+    fn test_n_hops_for_refuses_runaway_polar_expansion() {
+        // Top-row cells at fine precision: metres-per-cell tends to zero.
+        for hash in ["zzzzzzzzz", "zzzzzzzzzzzz", "bpbpbpbpbpbp"] {
+            let result = n_hops_for_core(hash, 1000.0);
+            assert!(
+                result.is_err(),
+                "{hash} should refuse a 1 km expansion, got {result:?} hops"
+            );
+        }
+    }
+
+    /// The cap must not reject expansions that are merely large but workable.
+    #[test]
+    fn test_n_hops_for_allows_large_but_sane_expansion() {
+        // 50 km at p6 near latitude 45: tens of hops.
+        let hops = n_hops_for_core("f2h30f", 50_000.0).unwrap();
+        assert!(hops > 10 && hops < MAX_EXPANSION_HOPS, "got {hops} hops");
+    }
+
+    /// The group hop count comes from the narrowest cell, not from whichever
+    /// cell happens to be listed first — so it cannot depend on input order.
+    #[test]
+    fn test_group_hops_sized_on_the_narrowest_cell() {
+        let equator = encode((10.0, 0.0).into(), 6).unwrap();
+        let arctic = encode((10.0, 84.0).into(), 6).unwrap();
+
+        let forward = n_hops_for_group_core([equator.as_str(), arctic.as_str()], 5000.0).unwrap();
+        let backward = n_hops_for_group_core([arctic.as_str(), equator.as_str()], 5000.0).unwrap();
+        assert_eq!(forward, backward);
+
+        // The narrow arctic cell dictates the count for the whole group.
+        assert_eq!(forward, n_hops_for_core(&arctic, 5000.0).unwrap());
+        assert!(forward > n_hops_for_core(&equator, 5000.0).unwrap());
+    }
+
+    /// A runaway member must be refused wherever it sits in the group.
+    #[test]
+    fn test_group_hops_refuse_a_runaway_member_anywhere() {
+        let sane = "f2h30fg2h";
+        let polar = "zzzzzzzzz";
+        assert!(n_hops_for_group_core([polar, sane], 1000.0).is_err());
+        assert!(n_hops_for_group_core([sane, polar], 1000.0).is_err());
     }
 }
