@@ -139,3 +139,89 @@ def test_arrow_null_geohash_reports_the_null():
     lists = pa.array([["f2h30", None], ["f2h31"]], type=pa.list_(pa.string()))
     with pytest.raises(ValueError, match=r"contains a null at position 1"):
         geohash_polygon.expand_geohash_mapping_arrow(geog_ids, lists, 100.0)
+
+
+# ── decode_many_to_wkb_arrow / decode_many_to_ewkb_arrow ─────────────────────
+
+HASHES = ["dr5ru7", "dpz8zzzz", "9q8yy9ve", "f2h30"]
+
+
+def test_wkb_arrow_matches_the_list_api():
+    result = pa.array(geohash_polygon.decode_many_to_wkb_arrow(pa.array(HASHES, type=pa.utf8())))
+    assert result.type == pa.large_binary()
+    assert result.to_pylist() == geohash_polygon.decode_many_to_wkb(HASHES)
+
+
+def test_ewkb_arrow_matches_the_list_api():
+    result = pa.array(
+        geohash_polygon.decode_many_to_ewkb_arrow(pa.array(HASHES, type=pa.utf8()), 32632)
+    )
+    assert result.to_pylist() == geohash_polygon.decode_many_to_ewkb(HASHES, 32632)
+
+
+def test_ewkb_arrow_srid_defaults_to_4326():
+    array = pa.array(HASHES, type=pa.utf8())
+    default = pa.array(geohash_polygon.decode_many_to_ewkb_arrow(array))
+    explicit = pa.array(geohash_polygon.decode_many_to_ewkb_arrow(array, 4326))
+    assert default.to_pylist() == explicit.to_pylist()
+
+
+def test_wkb_arrow_row_widths():
+    array = pa.array(HASHES, type=pa.utf8())
+    wkb = pa.array(geohash_polygon.decode_many_to_wkb_arrow(array))
+    ewkb = pa.array(geohash_polygon.decode_many_to_ewkb_arrow(array))
+    assert all(len(v) == 93 for v in wkb.to_pylist())
+    assert all(len(v) == 97 for v in ewkb.to_pylist())
+
+
+def test_wkb_arrow_preserves_nulls():
+    array = pa.array(["dr5ru7", None, "f2h30"], type=pa.utf8())
+    result = pa.array(geohash_polygon.decode_many_to_wkb_arrow(array))
+    assert result.null_count == 1
+    assert result[1].as_py() is None
+    assert result[0].as_py() == geohash_polygon.decode_many_to_wkb(["dr5ru7"])[0]
+    assert result[2].as_py() == geohash_polygon.decode_many_to_wkb(["f2h30"])[0]
+
+
+def test_wkb_arrow_accepts_large_utf8():
+    small = pa.array(HASHES, type=pa.utf8())
+    large = pa.array(HASHES, type=pa.large_utf8())
+    assert (
+        pa.array(geohash_polygon.decode_many_to_wkb_arrow(small)).to_pylist()
+        == pa.array(geohash_polygon.decode_many_to_wkb_arrow(large)).to_pylist()
+    )
+
+
+def test_wkb_arrow_empty():
+    result = pa.array(geohash_polygon.decode_many_to_wkb_arrow(pa.array([], type=pa.utf8())))
+    assert len(result) == 0
+
+
+def test_wkb_arrow_sliced_input():
+    array = pa.array(HASHES, type=pa.utf8()).slice(1, 2)
+    result = pa.array(geohash_polygon.decode_many_to_wkb_arrow(array))
+    assert result.to_pylist() == geohash_polygon.decode_many_to_wkb(HASHES[1:3])
+
+
+def test_wkb_arrow_rejects_non_string_array():
+    with pytest.raises(ValueError, match="Utf8 or LargeUtf8"):
+        geohash_polygon.decode_many_to_wkb_arrow(pa.array([1, 2, 3], type=pa.int64()))
+
+
+def test_wkb_arrow_rejects_invalid_geohash():
+    with pytest.raises(ValueError):
+        geohash_polygon.decode_many_to_wkb_arrow(pa.array(["not-a-geohash!"], type=pa.utf8()))
+
+
+def test_wkb_arrow_honours_num_threads():
+    array = pa.array(HASHES, type=pa.utf8())
+    single = pa.array(geohash_polygon.decode_many_to_wkb_arrow(array, num_threads=1))
+    multi = pa.array(geohash_polygon.decode_many_to_wkb_arrow(array, num_threads=4))
+    assert single.to_pylist() == multi.to_pylist()
+
+
+def test_wkb_arrow_round_trips_a_larger_column():
+    """Enough rows to cross rayon's chunk boundaries."""
+    hashes = [geohash_polygon.encode(-73.5 + i * 1e-4, 45.5 + i * 1e-4, 7) for i in range(5000)]
+    result = pa.array(geohash_polygon.decode_many_to_wkb_arrow(pa.array(hashes, type=pa.utf8())))
+    assert result.to_pylist() == geohash_polygon.decode_many_to_wkb(hashes)
