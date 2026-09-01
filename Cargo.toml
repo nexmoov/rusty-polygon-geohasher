@@ -18,6 +18,7 @@ geohash = "^0.13.1"
 queue = "^0.3.1"
 geo-types = "^0.7.13"
 rayon = "^1"
+rustc-hash = "2"
 
 [lib]
 name = "geohash_polygon"
