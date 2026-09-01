@@ -1,7 +1,7 @@
 use geo::{BoundingRect, Intersects, Polygon, PreparedGeometry, Rect, Relate};
 
-use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StringArray};
 use arrow_array::builder::LargeStringBuilder;
+use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use geohash::{decode_bbox, encode, GeohashError};
 use pyo3::prelude::*;
@@ -623,7 +623,11 @@ fn decode_many_exactly(
 #[inline]
 fn serialize_bbox(xmin: f64, ymin: f64, xmax: f64, ymax: f64, srid: Option<u32>) -> Vec<u8> {
     let capacity = if srid.is_some() { 97 } else { 93 };
-    let wkb_type = if srid.is_some() { 3u32 | 0x20000000u32 } else { 3u32 };
+    let wkb_type = if srid.is_some() {
+        3u32 | 0x20000000u32
+    } else {
+        3u32
+    };
     let mut buf = Vec::with_capacity(capacity);
     buf.push(0x01u8);
     buf.extend_from_slice(&wkb_type.to_le_bytes());
@@ -795,7 +799,11 @@ where
 /// reaches at least `expansion_m` in every direction from every cell at any
 /// precision level.
 #[pyfunction]
-fn expand_geohashes(py: Python<'_>, geohashes: Vec<String>, expansion_m: f64) -> PyResult<Vec<String>> {
+fn expand_geohashes(
+    py: Python<'_>,
+    geohashes: Vec<String>,
+    expansion_m: f64,
+) -> PyResult<Vec<String>> {
     if geohashes.is_empty() {
         return Ok(vec![]);
     }
@@ -956,23 +964,23 @@ fn expand_geohash_mapping_arrow(
             let geog_id = geog_id_arr.value(i).to_owned();
             let start = offsets[i] as usize;
             let end = offsets[i + 1] as usize;
-            let hashes: Vec<String> =
-                (start..end).map(|j| values_arr.value(j).to_owned()).collect();
+            let hashes: Vec<String> = (start..end)
+                .map(|j| values_arr.value(j).to_owned())
+                .collect();
             (geog_id, hashes, n_hops_per_group[i])
         })
         .collect();
 
     // Release the GIL and expand all groups in parallel via Rayon.
-    let results: Vec<(String, Result<HashSet<String>, GeohashError>)> =
-        py.detach(|| {
-            groups
-                .into_par_iter()
-                .map(|(geog_id, hashes, n_hops)| {
-                    let hash_set: HashSet<String> = hashes.into_iter().collect();
-                    (geog_id, expand_geohash_set(&hash_set, n_hops))
-                })
-                .collect()
-        });
+    let results: Vec<(String, Result<HashSet<String>, GeohashError>)> = py.detach(|| {
+        groups
+            .into_par_iter()
+            .map(|(geog_id, hashes, n_hops)| {
+                let hash_set: HashSet<String> = hashes.into_iter().collect();
+                (geog_id, expand_geohash_set(&hash_set, n_hops))
+            })
+            .collect()
+    });
 
     // Count output rows so we can pre-allocate Arrow builders exactly once.
     let total_out: usize = results
@@ -1054,14 +1062,30 @@ mod tests {
         let coord_offset = if has_srid { 17usize } else { 13usize };
         assert_eq!(buf.len(), expected_len);
         assert_eq!(buf[0], 0x01, "byte order must be little-endian");
-        assert_eq!(u32::from_le_bytes(buf[1..5].try_into().unwrap()), expected_type, "WKB type mismatch");
+        assert_eq!(
+            u32::from_le_bytes(buf[1..5].try_into().unwrap()),
+            expected_type,
+            "WKB type mismatch"
+        );
         let mut offset = 5;
         if let Some(expected_srid) = srid {
-            assert_eq!(u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()), expected_srid, "SRID mismatch");
+            assert_eq!(
+                u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()),
+                expected_srid,
+                "SRID mismatch"
+            );
             offset += 4;
         }
-        assert_eq!(u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()), 1, "ring count must be 1");
-        assert_eq!(u32::from_le_bytes(buf[offset + 4..offset + 8].try_into().unwrap()), 5, "point count must be 5");
+        assert_eq!(
+            u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap()),
+            1,
+            "ring count must be 1"
+        );
+        assert_eq!(
+            u32::from_le_bytes(buf[offset + 4..offset + 8].try_into().unwrap()),
+            5,
+            "point count must be 5"
+        );
         // Points: (xmin,ymin), (xmax,ymin), (xmax,ymax), (xmin,ymax), (xmin,ymin)
         (
             read_f64_le(buf, coord_offset),      // xmin — point 0 x
@@ -1086,7 +1110,8 @@ mod tests {
     #[test]
     fn test_bbox_to_wkb_coordinates() {
         let (xmin, ymin, xmax, ymax) = (-73.5853_f64, 45.5017, -73.5702, 45.5098);
-        let (gx1, gy1, gx2, gy2) = parse_polygon_bbox(&serialize_bbox(xmin, ymin, xmax, ymax, None), None);
+        let (gx1, gy1, gx2, gy2) =
+            parse_polygon_bbox(&serialize_bbox(xmin, ymin, xmax, ymax, None), None);
         assert_eq!(gx1, xmin);
         assert_eq!(gy1, ymin);
         assert_eq!(gx2, xmax);
@@ -1104,7 +1129,12 @@ mod tests {
     // ── geohashes_to_wkb (pure Rust core) ────────────────────────────────────
 
     fn run(geohashes: Vec<&str>, num_threads: Option<usize>) -> Vec<Result<Vec<u8>, GeohashError>> {
-        let pool = num_threads.map(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().unwrap());
+        let pool = num_threads.map(|n| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .build()
+                .unwrap()
+        });
         geohashes_to_wkb(geohashes.into_iter().map(String::from).collect(), &pool)
     }
 
@@ -1135,10 +1165,26 @@ mod tests {
             let wkb = results[i].as_ref().unwrap();
             let expected = decode_bbox(hash).unwrap();
             let (xmin, ymin, xmax, ymax) = parse_polygon_bbox(wkb, None);
-            assert_eq!(xmin, expected.min().x, "xmin mismatch at index {i} ({hash})");
-            assert_eq!(ymin, expected.min().y, "ymin mismatch at index {i} ({hash})");
-            assert_eq!(xmax, expected.max().x, "xmax mismatch at index {i} ({hash})");
-            assert_eq!(ymax, expected.max().y, "ymax mismatch at index {i} ({hash})");
+            assert_eq!(
+                xmin,
+                expected.min().x,
+                "xmin mismatch at index {i} ({hash})"
+            );
+            assert_eq!(
+                ymin,
+                expected.min().y,
+                "ymin mismatch at index {i} ({hash})"
+            );
+            assert_eq!(
+                xmax,
+                expected.max().x,
+                "xmax mismatch at index {i} ({hash})"
+            );
+            assert_eq!(
+                ymax,
+                expected.max().y,
+                "ymax mismatch at index {i} ({hash})"
+            );
         }
     }
 
@@ -1166,7 +1212,10 @@ mod tests {
     #[test]
     fn test_bbox_to_ewkb_coordinates() {
         let (xmin, ymin, xmax, ymax) = (-73.5853_f64, 45.5017, -73.5702, 45.5098);
-        let (gx1, gy1, gx2, gy2) = parse_polygon_bbox(&serialize_bbox(xmin, ymin, xmax, ymax, Some(4326)), Some(4326));
+        let (gx1, gy1, gx2, gy2) = parse_polygon_bbox(
+            &serialize_bbox(xmin, ymin, xmax, ymax, Some(4326)),
+            Some(4326),
+        );
         assert_eq!(gx1, xmin);
         assert_eq!(gy1, ymin);
         assert_eq!(gx2, xmax);
@@ -1188,8 +1237,17 @@ mod tests {
         srid: u32,
         num_threads: Option<usize>,
     ) -> Vec<Result<Vec<u8>, GeohashError>> {
-        let pool = num_threads.map(|n| rayon::ThreadPoolBuilder::new().num_threads(n).build().unwrap());
-        geohashes_to_ewkb(geohashes.into_iter().map(String::from).collect(), srid, &pool)
+        let pool = num_threads.map(|n| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .build()
+                .unwrap()
+        });
+        geohashes_to_ewkb(
+            geohashes.into_iter().map(String::from).collect(),
+            srid,
+            &pool,
+        )
     }
 
     #[test]
@@ -1219,10 +1277,26 @@ mod tests {
             let ewkb = results[i].as_ref().unwrap();
             let expected = decode_bbox(hash).unwrap();
             let (xmin, ymin, xmax, ymax) = parse_polygon_bbox(ewkb, Some(4326));
-            assert_eq!(xmin, expected.min().x, "xmin mismatch at index {i} ({hash})");
-            assert_eq!(ymin, expected.min().y, "ymin mismatch at index {i} ({hash})");
-            assert_eq!(xmax, expected.max().x, "xmax mismatch at index {i} ({hash})");
-            assert_eq!(ymax, expected.max().y, "ymax mismatch at index {i} ({hash})");
+            assert_eq!(
+                xmin,
+                expected.min().x,
+                "xmin mismatch at index {i} ({hash})"
+            );
+            assert_eq!(
+                ymin,
+                expected.min().y,
+                "ymin mismatch at index {i} ({hash})"
+            );
+            assert_eq!(
+                xmax,
+                expected.max().x,
+                "xmax mismatch at index {i} ({hash})"
+            );
+            assert_eq!(
+                ymax,
+                expected.max().y,
+                "ymax mismatch at index {i} ({hash})"
+            );
         }
     }
 
@@ -1368,10 +1442,7 @@ mod tests {
         // wraps, so they are neighbours across the antimeridian.
         let mut buf = [0u64; 8];
         let count = ghbits::neighbors(ghbits::pack("b").unwrap(), 1, &mut buf);
-        let got: HashSet<String> = buf[..count]
-            .iter()
-            .map(|&v| ghbits::unpack(v, 1))
-            .collect();
+        let got: HashSet<String> = buf[..count].iter().map(|&v| ghbits::unpack(v, 1)).collect();
         assert!(got.contains("z"), "expected 'z' among {got:?}");
     }
 
