@@ -38,6 +38,31 @@ def decode_many_to_ewkb(
     num_threads: int | None = None,
 ) -> list[bytes]: ...
 
+def decode_many_to_wkb_arrow(
+    geohashes: Any,
+    num_threads: int | None = None,
+) -> Any:
+    """Decode geohashes to WKB polygon bounding boxes, via Arrow.
+
+    geohashes: pyarrow Utf8 or LargeUtf8 Array (single chunk — call
+        .combine_chunks() first)
+    Returns a LargeBinary Array; null inputs give null outputs.
+    Convert to pyarrow via pa.array(result).
+    """
+    ...
+
+def decode_many_to_ewkb_arrow(
+    geohashes: Any,
+    srid: int = 4326,
+    num_threads: int | None = None,
+) -> Any:
+    """Decode geohashes to EWKB polygons with an embedded SRID, via Arrow.
+
+    Like decode_many_to_wkb_arrow but with the SRID in the header, ready for a
+    PostGIS geometry column without a separate ST_SetSRID.
+    """
+    ...
+
 def expand_geohashes(
     geohashes: list[str],
     expansion_m: float,
